@@ -59,6 +59,10 @@ from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, get_open_zmq_ipc_path
 from vllm.version import __version__ as VLLM_VERSION
+from huggingface_hub import login
+
+# Replace 'your_token_here' with the token you copied from Hugging Face
+login(token='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')
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
@@ -78,7 +82,7 @@ async def lifespan(app: FastAPI):
 
             async def _force_log():
                 while True:
-                    await asyncio.sleep(10.)
+                    await asyncio.sleep(1.)
                     await engine_client.do_log_stats()
 
             task = asyncio.create_task(_force_log())

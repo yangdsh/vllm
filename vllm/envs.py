@@ -266,7 +266,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
 
     # this is used for configuring the default logging level
     "VLLM_LOGGING_LEVEL":
-    lambda: os.getenv("VLLM_LOGGING_LEVEL", "INFO"),
+    lambda: os.getenv("VLLM_LOGGING_LEVEL", "WARNING"),
 
     # Trace function calls
     # If set to 1, vllm will trace function calls
