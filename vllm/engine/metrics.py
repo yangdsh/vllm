@@ -346,7 +346,7 @@ class LoggingStatLogger(StatLoggerBase):
         # Update spec decode metrics
         self.maybe_update_spec_decode_metrics(stats)
 
-        self.local_interval = 0.01
+        self.local_interval = 1
         # Log locally every local_interval seconds.
         if local_interval_elapsed(stats.now, self.last_local_log,
                                   self.local_interval):

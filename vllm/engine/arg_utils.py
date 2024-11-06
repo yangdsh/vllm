@@ -157,7 +157,7 @@ class EngineArgs:
     preemption_mode: Optional[str] = None
 
     scheduler_delay_factor: float = 0.0
-    enable_chunked_prefill: Optional[bool] = None
+    enable_chunked_prefill: Optional[bool] = False
 
     guided_decoding_backend: str = 'outlines'
     # Speculative decoding configuration.
@@ -985,7 +985,7 @@ class EngineArgs:
         if not self.enable_chunked_prefill and use_long_context:
             logger.warning(
                 "The model has a long context length (%s). This may cause OOM "
-                "errors during the initial memory profiling phase, or result "
+                "during the initial memory profiling phase, or result "
                 "in low performance due to small KV cache space. Consider "
                 "setting --max-model-len to a smaller value.", max_model_len)
 

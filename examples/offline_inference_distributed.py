@@ -17,11 +17,6 @@ from vllm import LLM, SamplingParams
 assert Version(ray.__version__) >= Version(
     "2.22.0"), "Ray version must be at least 2.22.0"
 
-from huggingface_hub import login
-
-# Replace 'your_token_here' with the token you copied from Hugging Face
-login(token='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')
-
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=100)
 

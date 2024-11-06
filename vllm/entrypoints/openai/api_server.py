@@ -59,10 +59,6 @@ from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser, get_open_zmq_ipc_path
 from vllm.version import __version__ as VLLM_VERSION
-from huggingface_hub import login
-
-# Replace 'your_token_here' with the token you copied from Hugging Face
-login(token='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')
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
