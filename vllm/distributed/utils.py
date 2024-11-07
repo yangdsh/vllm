@@ -60,7 +60,7 @@ def get_pp_indices(num_hidden_layers: int, pp_rank: int,
     the last partition will have the remaining layers.
     """
     partition_list_str = envs.VLLM_PP_LAYER_PARTITION
-    if partition_list_str is not None:
+    if partition_list_str is not None and len(partition_list_str):
         try:
             partitions = [
                 int(layer) for layer in partition_list_str.split(",")

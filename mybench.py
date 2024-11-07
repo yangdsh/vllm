@@ -11,7 +11,7 @@ def restart_ray():
     # Stop Ray
     subprocess.run("ray stop --force", shell=True, check=True)
     # Start Ray (adjust the options as needed)
-    subprocess.run("ray start --head", shell=True, check=True)
+    subprocess.run(f"VLLM_PP_LAYER_PARTITION={os.environ["VLLM_PP_LAYER_PARTITION"]} RAY_DEDUP_LOGS=0 ray start --head", shell=True, check=True)
 
 def restart_ray_remote(hostname):
     # Get the current node IP (head node IP)
@@ -23,7 +23,7 @@ def restart_ray_remote(hostname):
 
     # Construct the SSH commands to run on the remote node
     stop_command = f"ssh {hostname} 'ray stop --force'"
-    start_command = f"ssh {hostname} 'VLLM_PP_LAYER_PARTITION={os.environ["VLLM_PP_LAYER_PARTITION"]} ray start --address=\"{head_node_ip}:6379\"'"
+    start_command = f"ssh {hostname} 'VLLM_PP_LAYER_PARTITION={os.environ["VLLM_PP_LAYER_PARTITION"]} RAY_DEDUP_LOGS=0 ray start --address=\"{head_node_ip}:6379\"'"
 
     # Execute the commands
     try:
@@ -35,22 +35,22 @@ def restart_ray_remote(hostname):
 
 def set_pp_layers(pp, num_layers):
     if pp <= 2 or original_pp_partition:
-        os.environ["VLLM_PP_LAYER_PARTITION"] = ''
-        return
-    layer_per_stage = math.ceil(num_layers / pp)
-    first_last = num_layers - (pp - 2) * layer_per_stage
-    first = first_last // 2
-    last = first_last - first
-    layer_partition = [first]
-    layer_partition += [layer_per_stage for i in range(pp-2)]
-    layer_partition.append(last)
-    os.environ["VLLM_PP_LAYER_PARTITION"] = ','.join(str(i) for i in layer_partition)
+        os.environ["VLLM_PP_LAYER_PARTITION"] = ""
+    else:
+        layer_per_stage = math.ceil(num_layers / pp)
+        first_last = num_layers - (pp - 2) * layer_per_stage
+        first = first_last // 2
+        last = first_last - first
+        layer_partition = [first]
+        layer_partition += [layer_per_stage for i in range(pp-2)]
+        layer_partition.append(last)
+        os.environ["VLLM_PP_LAYER_PARTITION"] = ','.join(str(i) for i in layer_partition)
     print("layer partition: ", os.environ["VLLM_PP_LAYER_PARTITION"])
     restart_ray()
     restart_ray_remote("node2")
 
 # Constants for server log and commands
-original_pp_partition = False
+original_pp_partition = True
 DIR = "results-405B-request_rates"
 NUM_LAYERS = 126
 if not os.path.exists(DIR):
