@@ -4,6 +4,7 @@
 echo "from huggingface_hub import login; login(token='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')" | python
 pip install https://vllm-wheels.s3.us-west-2.amazonaws.com/nightly/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
 python python_only_dev.py
+pip install 'accelerate>=0.26.0'
 
 vllm serve meta-llama/Llama-3.1-70B --tensor-parallel-size 4 --pipeline-parallel-size 2
 
@@ -20,3 +21,5 @@ python benchmarks/benchmark_serving.py \
     --num-prompts 128 \
     --random-input-len 1024 \
     --request-rate 50
+
+# python benchmarks/benchmark_serving.py --model neuralmagic/Meta-Llama-3.1-405B-Instruct-quantized.w8a8 --dataset-name random --num-prompts 32 --random-input-len 1024 --request-rate 1

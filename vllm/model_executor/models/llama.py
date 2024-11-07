@@ -57,6 +57,14 @@ from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
 
+import logging
+
+logger = logging.getLogger("ray")
+logger.setLevel(logging.DEBUG)  # Adjust the level as needed
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(handler)
+
 
 class LlamaMLP(nn.Module):
 
@@ -304,6 +312,7 @@ class LlamaModel(nn.Module):
                                              prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        logger.info(f'pp rank: {get_pp_group().rank_in_group}  layers: {self.start_layer}-{self.end_layer}')
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
