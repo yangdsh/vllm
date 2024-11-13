@@ -7,6 +7,18 @@ import math
 import subprocess
 import socket
 
+# Constants for server log and commands
+original_pp_partition = True
+# MODEL = 'neuralmagic/Meta-Llama-3.1-405B-Instruct-quantized.w8a8'
+# MODEL = 'meta-llama/Llama-3.1-70B'
+MODEL = 'Qwen/Qwen2.5-32B'
+DIR = f"results/{MODEL.split('/')[-1]}"
+if not os.path.exists(DIR):
+    os.makedirs(DIR)
+LOG_FILE = f"{DIR}/vllm.log"
+NUM_LAYERS = 126
+
+
 def restart_ray():
     # Stop Ray
     subprocess.run("ray stop --force", shell=True, check=True)
@@ -33,38 +45,34 @@ def restart_ray_remote(hostname):
     except subprocess.CalledProcessError as e:
         print(f"Failed to restart Ray on {hostname}: {e}")
 
-def set_pp_layers(pp, num_layers):
+def set_pp_layers(pp):
     if pp <= 2 or original_pp_partition:
         os.environ["VLLM_PP_LAYER_PARTITION"] = ""
+        return
     else:
-        layer_per_stage = math.ceil(num_layers / pp)
-        first_last = num_layers - (pp - 2) * layer_per_stage
+        layer_per_stage = math.ceil(NUM_LAYERS / pp)
+        first_last = NUM_LAYERS - (pp - 2) * layer_per_stage
         first = first_last // 2
         last = first_last - first
         layer_partition = [first]
         layer_partition += [layer_per_stage for i in range(pp-2)]
         layer_partition.append(last)
         os.environ["VLLM_PP_LAYER_PARTITION"] = ','.join(str(i) for i in layer_partition)
+        os.environ["VLLM_PP_LAYER_PARTITION"] = '31,31,33,31'
     print("layer partition: ", os.environ["VLLM_PP_LAYER_PARTITION"])
     restart_ray()
     restart_ray_remote("node2")
 
-# Constants for server log and commands
-original_pp_partition = True
-DIR = "results-405B-request_rates"
-NUM_LAYERS = 126
-if not os.path.exists(DIR):
-    os.makedirs(DIR)
-LOG_FILE = f"{DIR}/vllm.log"
-MODEL = 'neuralmagic/Meta-Llama-3.1-405B-Instruct-quantized.w8a8'
-# MODEL = 'meta-llama/Llama-3.1-70B'
-VLLM_SERVER_CMD_TEMPLATE = ("FI_EFA_USE_DEVICE_RDMA=1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH "
+
+VLLM_SERVER_CMD_TEMPLATE = ("NCCL_DEBUG=INFO FI_EFA_USE_DEVICE_RDMA=1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH "
                             f"vllm serve {MODEL} --disable_custom_all_reduce "
-                            "--max-model-len 4096 "
+                            "--max-model-len 16384 "
                             "--gpu_memory_utilization 0.95 "
                             "--enable-chunked-prefill "
-                            "--tensor-parallel-size {} --pipeline-parallel-size {} --distributed-executor-backend ray")
-CLIENT_CMD_TEMPLATE = (f"python benchmarks/benchmark_serving.py --result-dir {DIR} --save-result --model {MODEL} --dataset-name random "
+                            "--tensor-parallel-size {} --pipeline-parallel-size {} "
+                            # "--distributed-executor-backend mp"
+                            )
+CLIENT_CMD_TEMPLATE = (f"python benchmarks/benchmark_serving.py --result-dir {DIR} --save-result --model {MODEL} --dataset-name random --random-output-len 1"
 "--result-filename {} --num-prompts {} --random-input-len {} --request-rate {} --max-concurrency {}")
 SERVER_READY_PATTERN = r"Route: /v1/embeddings, Methods: POST"
 CUDA_OOM_PATTERN = r"CUDA out of memory"
@@ -73,8 +81,8 @@ RAISE_PATTERN = r"raise"
 skip_starting_server = False
 
 # Argument combinations
-server_combinations = [(t, p) for t in [1,2,4,8,16] for p in [4] if t * p >= 16 and t * p <= 16]
-client_combinations = [(prompt_len, rate * max_concurrency, max_concurrency) for prompt_len in [1024] for rate in [1] for max_concurrency in [10, 20, 30]]  # Adjust prompt lengths and request rates as needed
+server_combinations = [(t, p) for t in [8] for p in [1,2,4,8,16] if t * p <= 8 and t * p >= 4]
+client_combinations = [(prompt_len, rate * max_concurrency, max_concurrency) for prompt_len in [128, 2048, 16384] for rate in [1] for max_concurrency in [16, 32, 64]]  # Adjust prompt lengths and request rates as needed
 
 
 def run_server(tensor_parallel_size, pipeline_parallel_size):
@@ -110,7 +118,7 @@ def wait_for_server_ready(log_file_name, timeout=600):
 
 def run_client(random_input_len, request_rate, max_concurrency, tensor_parallel_size, pipeline_parallel_size):
     """Run the client with specified input length and request rate, saving to file."""
-    result_filename = f"results_{tensor_parallel_size}_{pipeline_parallel_size}_{random_input_len}_{request_rate}_{max_concurrency}_{"mypp" if original_pp_partition else None}.json"
+    result_filename = f"results_{tensor_parallel_size}_{pipeline_parallel_size}_{random_input_len}_{request_rate}_{max_concurrency}_mp{"mypp" if not original_pp_partition else ""}.json"
     # run client
     client_cmd = CLIENT_CMD_TEMPLATE.format(result_filename, max_concurrency * 10, random_input_len, request_rate, max_concurrency)
     print(f"Running client with input length {random_input_len} and request rate {request_rate}")
@@ -133,7 +141,7 @@ def clean_log_file(log_file_name):
 if __name__ == "__main__":
     # Loop through server configurations
     for tensor_parallel_size, pipeline_parallel_size in server_combinations:
-        set_pp_layers(pipeline_parallel_size, NUM_LAYERS)
+        set_pp_layers(pipeline_parallel_size)
         if not skip_starting_server:
             kill_server()  # Ensure no previous server instance is running
             log_file_name = f"{LOG_FILE}_{tensor_parallel_size}_{pipeline_parallel_size}.log"
