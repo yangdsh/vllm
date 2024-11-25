@@ -23,3 +23,7 @@ python benchmarks/benchmark_serving.py \
     --request-rate 50
 
 # python benchmarks/benchmark_serving.py --model neuralmagic/Meta-Llama-3.1-405B-Instruct-quantized.w8a8 --dataset-name random --num-prompts 32 --random-input-len 1024 --request-rate 1
+
+python benchmarks/benchmark_serving.py --model Qwen/Qwen2.5-32B --dataset-name sharegpt --dataset-path ~/BurstGPT/example/preprocess_data/shareGPT.json --num-prompts 128 --random-input-len 1024 --request-rate 8 --max-concurrency 8 --input-lens 128 1024 2048 --input-ratios 0.6 0.3 0.1 
+
+FI_EFA_USE_DEVICE_RDMA=1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH NCCL_DEBUG=INFO vllm serve meta-llama/Llama-3.1-70B --disable_custom_all_reduce --max-model-len 16384 --enable-chunked-prefill --tensor-parallel-size 4 --pipeline-parallel-size 2

@@ -3,20 +3,44 @@ import time
 import subprocess
 import re
 import math
+import psutil
 
 import subprocess
 import socket
 
 # Constants for server log and commands
 original_pp_partition = True
+mix_prompts = False
 # MODEL = 'neuralmagic/Meta-Llama-3.1-405B-Instruct-quantized.w8a8'
 # MODEL = 'meta-llama/Llama-3.1-70B'
 MODEL = 'Qwen/Qwen2.5-32B'
+# MODEL = 'Qwen/Qwen2-72B-Instruct'
 DIR = f"results/{MODEL.split('/')[-1]}"
+DIR = DIR + "-mix-prompts" if mix_prompts else DIR
 if not os.path.exists(DIR):
     os.makedirs(DIR)
 LOG_FILE = f"{DIR}/vllm.log"
 NUM_LAYERS = 126
+DATASET = 'csv' # 'random'
+
+# Argument combinations
+server_combinations = [(t, p) for t in [4] for p in [1] if t * p <= 8 and t * p >= 4]
+'''client_combinations_ = [(prompt_len, rate * max_concurrency, max_concurrency) for prompt_len in [128, 1024, 2048, 4096, 8192] for rate in [1] for max_concurrency in [32, 64]]
+client_combinations = []
+for random_input_len, request_rate, max_concurrency in client_combinations_:
+    if mix_prompts:
+        random_input_len = 2
+    else:
+        request_rate = request_rate * (1024 / random_input_len)
+        if request_rate < 1:
+            continue
+        request_rate = int(request_rate)
+        max_concurrency = int(max_concurrency * (1024 / random_input_len))
+    comb = (random_input_len, request_rate, max_concurrency)
+    if comb not in client_combinations:
+        client_combinations.append(comb)'''
+client_combinations = [(prompt_len, rate * max_concurrency, max_concurrency, input_len_range) for prompt_len in [1024] for rate in [1] for max_concurrency in [32] for input_len_range in [[1, 512], [512, 2048], [1, 2048]]]
+
 
 
 def restart_ray():
@@ -64,36 +88,34 @@ def set_pp_layers(pp):
     restart_ray_remote("node2")
 
 
-VLLM_SERVER_CMD_TEMPLATE = ("NCCL_DEBUG=INFO FI_EFA_USE_DEVICE_RDMA=1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH "
+VLLM_SERVER_CMD_TEMPLATE = (#"NCCL_DEBUG=INFO FI_EFA_USE_DEVICE_RDMA=1 LD_LIBRARY_PATH=$LD_LIBRARY_PATH "
                             f"vllm serve {MODEL} --disable_custom_all_reduce "
                             "--max-model-len 16384 "
                             "--gpu_memory_utilization 0.95 "
                             "--enable-chunked-prefill "
                             "--tensor-parallel-size {} --pipeline-parallel-size {} "
-                            # "--distributed-executor-backend mp"
+                            # "--distributed-executor-backend ray "
                             )
-CLIENT_CMD_TEMPLATE = (f"python benchmarks/benchmark_serving.py --result-dir {DIR} --save-result --model {MODEL} --dataset-name random --random-output-len 1"
-"--result-filename {} --num-prompts {} --random-input-len {} --request-rate {} --max-concurrency {}")
+MIX = "--input-lens 128 2048 --input-ratios 0.89 0.11 " if mix_prompts else " "
+CLIENT_CMD_TEMPLATE = (f"python benchmarks/benchmark_serving.py --result-dir {DIR} --save-result --model {MODEL} --dataset-name {DATASET} --csv-file-path ~/BurstGPT/data/BurstGPT_1.csv --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json --sharegpt-output-len 64 --random-output-len 1 {MIX}"
+"--result-filename {} --num-prompts {} --random-input-len {} --input-lens {} {} --request-rate {} --max-concurrency {} --host 172.31.85.15 --prompt-len-threshold {}")
 SERVER_READY_PATTERN = r"Route: /v1/embeddings, Methods: POST"
 CUDA_OOM_PATTERN = r"CUDA out of memory"
 ERROR_PATTERN = r"error"
 RAISE_PATTERN = r"raise"
 skip_starting_server = False
 
-# Argument combinations
-server_combinations = [(t, p) for t in [8] for p in [1,2,4,8,16] if t * p <= 8 and t * p >= 4]
-client_combinations = [(prompt_len, rate * max_concurrency, max_concurrency) for prompt_len in [128, 2048, 16384] for rate in [1] for max_concurrency in [16, 32, 64]]  # Adjust prompt lengths and request rates as needed
 
 
-def run_server(tensor_parallel_size, pipeline_parallel_size):
+def run_server(tensor_parallel_size, pipeline_parallel_size, hostname):
     """Start the server with specific tensor and pipeline parallel sizes."""
-    log_file_name = f"{LOG_FILE}_{tensor_parallel_size}_{pipeline_parallel_size}.log"
+    log_file_name = f"{LOG_FILE}_{tensor_parallel_size}_{pipeline_parallel_size}_{hostname}.log"
     print(f"Starting server with tensor-parallel-size={tensor_parallel_size}, pipeline-parallel-size={pipeline_parallel_size}")
     server_cmd = VLLM_SERVER_CMD_TEMPLATE.format(tensor_parallel_size, pipeline_parallel_size)
     print(server_cmd)
     print(log_file_name)
     with open(log_file_name, "w") as log_file:
-        server_process = server_process = subprocess.Popen(server_cmd, shell=True, stdout=log_file, stderr=log_file)
+        server_process = server_process = subprocess.Popen(f"ssh {hostname} '{server_cmd}'", shell=True, stdout=log_file, stderr=log_file)
     return server_process, log_file_name
 
 def wait_for_server_ready(log_file_name, timeout=600):
@@ -116,22 +138,35 @@ def wait_for_server_ready(log_file_name, timeout=600):
     print("Server startup timed out.")
     return False
 
-def run_client(random_input_len, request_rate, max_concurrency, tensor_parallel_size, pipeline_parallel_size):
+def run_client(random_input_len, input_len_range, request_rate, max_concurrency, tensor_parallel_size, pipeline_parallel_size):
     """Run the client with specified input length and request rate, saving to file."""
-    result_filename = f"results_{tensor_parallel_size}_{pipeline_parallel_size}_{random_input_len}_{request_rate}_{max_concurrency}_mp{"mypp" if not original_pp_partition else ""}.json"
+    result_filename = f"results_{tensor_parallel_size}_{pipeline_parallel_size}_{input_len_range[0]}~{input_len_range[1]}_{request_rate}_{max_concurrency}{"_mypp" if not original_pp_partition else ""}.json"
     # run client
-    client_cmd = CLIENT_CMD_TEMPLATE.format(result_filename, max_concurrency * 10, random_input_len, request_rate, max_concurrency)
-    print(f"Running client with input length {random_input_len} and request rate {request_rate}")
+    num_prompts = 512
+    prompt_len_threshold = 512
+    client_cmd = CLIENT_CMD_TEMPLATE.format(result_filename, num_prompts, random_input_len, input_len_range[0], input_len_range[1], request_rate, max_concurrency, prompt_len_threshold)
+    print(client_cmd)
+    print(f"Running client with input length {input_len_range} and request rate {request_rate}")
     client_process = subprocess.Popen(client_cmd, shell=True)
     client_process.wait()
+
+def is_port_in_use(port):
+    for conn in psutil.net_connections():
+        if conn.laddr.port == port:
+            return True
+    return False
 
 def kill_server():
     """Kill any running server process."""
     try:
         subprocess.run("pkill -f 'vllm serve'", shell=True, check=True)
+        subprocess.run(["ssh", "node2", "pkill -f \\\"vllm serve\\\""], check=True)
         print("Killed any running 'vllm serve' process.")
     except subprocess.CalledProcessError as e:
         print("No 'vllm serve' processes were running:", e)
+    time.sleep(10)
+    if is_port_in_use(8000):
+        kill_server()
 
 def clean_log_file(log_file_name):
     """Remove log file before starting a new server."""
@@ -148,12 +183,13 @@ if __name__ == "__main__":
             clean_log_file(log_file_name)
 
             # Start server and check readiness
-            server_process, log_file_name = run_server(tensor_parallel_size, pipeline_parallel_size)
-            if not wait_for_server_ready(log_file_name):
+            _, log_file_name1 = run_server(tensor_parallel_size, pipeline_parallel_size, "localhost")
+            _, log_file_name2 = run_server(2, 4, "node2")
+            if not wait_for_server_ready(log_file_name1) or not wait_for_server_ready(log_file_name2):
                 print("Skipping to next server configuration due to startup issues.")
                 continue
 
         # Loop through client configurations without restarting the server
-        for random_input_len, request_rate, max_concurrency in client_combinations:
-            run_client(random_input_len, request_rate, max_concurrency, tensor_parallel_size, pipeline_parallel_size)
+        for random_input_len, request_rate, max_concurrency, input_len_range in client_combinations:
+            run_client(random_input_len, input_len_range, request_rate, max_concurrency, tensor_parallel_size, pipeline_parallel_size)
         print(f"Completed testing for tensor-parallel-size={tensor_parallel_size}, pipeline-parallel-size={pipeline_parallel_size}\n")
