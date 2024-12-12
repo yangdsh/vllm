@@ -28,6 +28,7 @@ import asyncio
 import gc
 import json
 import os
+import csv
 import random
 import time
 import warnings
@@ -37,6 +38,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import numpy as np
+import pandas as pd
 from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
                                   RequestFuncOutput)
 from tqdm.asyncio import tqdm
@@ -58,7 +60,6 @@ from benchmark_dataset import (BurstGPTDataset, HuggingFaceDataset,
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
-
 
 @dataclass
 class BenchmarkMetrics:
@@ -122,14 +123,17 @@ async def get_request(
 
     for request in input_requests:
         yield request
+        # Sample the request interval from the exponential distribution.
 
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
+        if input_timestamps and i+1 < len(input_timestamps):
+            interval = input_timestamps[i+1] - input_timestamps[i]
+        else:
+            # interval = np.random.exponential(1.0 / request_rate)
+            if request_rate == float("inf"):
+                # If the request rate is infinity, then we don't need to wait.
+                continue
+            interval = 1.0 / request_rate
 
-        # Sample the request interval from the gamma distribution.
-        # If burstiness is 1, it follows exponential distribution.
-        interval = np.random.gamma(shape=burstiness, scale=theta)
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -232,9 +236,9 @@ def calculate_metrics(
         median_itl_ms=np.median(itls or 0) * 1000,
         percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000)
                             for p in selected_percentiles],
-        mean_e2el_ms=np.mean(e2els or 0) * 1000,
+        mean_e2el_ms=np.median(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
-        median_e2el_ms=np.median(e2els or 0) * 1000,
+        median_e2el_ms=np.mean(e2els or 0) * 1000,
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
     )
@@ -242,17 +246,24 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+class ServerStat:
+    count: int
+    prompt_lens: list
+    ttft: float
+    def __init__(self):
+        self.count = 0
+        self.prompt_lens = []
+        self.ttft = 0
+        self.prompt_len = 0
+
 async def benchmark(
     backend: str,
-    api_url: str,
-    base_url: str,
     model_id: str,
     model_name: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: list[SampleRequest],
     logprobs: Optional[int],
     request_rate: float,
-    burstiness: float,
     disable_tqdm: bool,
     profile: bool,
     selected_percentile_metrics: list[str],
@@ -262,6 +273,67 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
 ):
+    server_stats = {}
+    
+    def get_api_url(prompt_len):    
+        api_url_short_prompts = f"http://{args.host}:{args.port}{args.endpoint}"
+        api_url_long_prompts = f"http://localhost:{args.port}{args.endpoint}"
+        # the first run
+        if api_url_short_prompts not in server_stats:
+            server_stats[api_url_short_prompts] = ServerStat()
+            server_stats[api_url_long_prompts] = ServerStat()
+            return api_url_short_prompts if prompt_len < args.prompt_len_threshold else api_url_long_prompts
+
+        if args.prompt_len_threshold == -1:
+            # return api_url_short_prompts if server_stats[api_url_short_prompts].count < server_stats[api_url_long_prompts].count else api_url_long_prompts
+            return api_url_short_prompts if server_stats[api_url_short_prompts].prompt_len < server_stats[api_url_long_prompts].prompt_len else api_url_long_prompts
+        else:
+            if prompt_len > args.prompt_len_threshold:
+                return api_url_long_prompts
+            #elif server_stats[api_url_long_prompts].prompt_len <= \
+            #    server_stats[api_url_short_prompts].prompt_len:
+            elif server_stats[api_url_long_prompts].count <= \
+                server_stats[api_url_short_prompts].count / 2:
+                return api_url_long_prompts
+            else:
+                return api_url_short_prompts
+                
+
+    def get_base_url(server):
+        base_url_short_prompts = f"http://{args.host}:{args.port}"
+        base_url_long_prompts = f"http://localhost:{args.port}"
+        if server == 0:
+            return base_url_short_prompts
+        else:
+            return base_url_long_prompts
+    
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
+    # This can be used once the minimum Python version is 3.10 or higher,
+    # and it will simplify the code in limited_request_func.
+    #    semaphore = (asyncio.Semaphore(max_concurrency)
+    #                 if max_concurrency else contextlib.nullcontext())
+    semaphore = (asyncio.Semaphore(max_concurrency)
+                 if max_concurrency else None)
+
+    async def limited_request_func(request_func_input, pbar):
+        if semaphore is None:
+            return await request_func(request_func_input=request_func_input,
+                                      pbar=pbar)
+        async with semaphore:
+            server = request_func_input.api_url
+            server_stats[server].count += 1
+            server_stats[server].prompt_len += request_func_input.prompt_len
+            # server_stats[server].approx_prompt_len
+            result = await request_func(request_func_input=request_func_input,
+                                      pbar=pbar)
+            result.server = server
+            server_stats[server].count -= 1
+            server_stats[server].prompt_len -= request_func_input.prompt_len
+            server_stats[server].ttft = (server_stats[server].ttft + result.ttft) * 0.5
+            # print(server, server_stats[server].count, result.ttft, request_func_input.prompt_len)
+            return result
+    
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
@@ -282,7 +354,7 @@ async def benchmark(
         model=model_id,
         model_name=model_name,
         prompt=test_prompt,
-        api_url=api_url,
+        api_url=get_api_url(test_prompt_len),
         prompt_len=test_prompt_len,
         output_len=test_output_len,
         logprobs=logprobs,
@@ -319,31 +391,8 @@ async def benchmark(
         if profile_output.success:
             print("Profiler started")
 
-    if burstiness == 1.0:
-        distribution = "Poisson process"
-    else:
-        distribution = "Gamma distribution"
-
     print(f"Traffic request rate: {request_rate}")
-    print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
-
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
-
-    # This can be used once the minimum Python version is 3.10 or higher,
-    # and it will simplify the code in limited_request_func.
-    #    semaphore = (asyncio.Semaphore(max_concurrency)
-    #                 if max_concurrency else contextlib.nullcontext())
-    semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
-
-    async def limited_request_func(request_func_input, pbar):
-        if semaphore is None:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
-        async with semaphore:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -359,7 +408,7 @@ async def benchmark(
         request_func_input = RequestFuncInput(model=req_model_id,
                                               model_name=req_model_name,
                                               prompt=prompt,
-                                              api_url=api_url,
+                                              api_url=get_api_url(prompt_len),
                                               prompt_len=prompt_len,
                                               output_len=output_len,
                                               logprobs=logprobs,
@@ -427,9 +476,13 @@ async def benchmark(
         metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
-        "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
+        "input_lens": [output.prompt_len for output in outputs],
+        "input_lens_localhost": [output.prompt_len for output in outputs if 'localhost' in output.server],
+        "input_lens_otherhost": [output.prompt_len for output in outputs if 'localhost' not in output.server],
         "ttfts": [output.ttft for output in outputs],
+        "ttfts_localhost": [output.ttft for output in outputs if 'localhost' in output.server],
+        "ttfts_otherhost": [output.ttft for output in outputs if 'localhost' not in output.server],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
@@ -539,7 +592,7 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
 
 
 def main(args: argparse.Namespace):
-    print(args)
+    # print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -549,16 +602,10 @@ def main(args: argparse.Namespace):
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
 
-    if args.base_url is not None:
-        api_url = f"{args.base_url}{args.endpoint}"
-        base_url = f"{args.base_url}"
-    else:
-        api_url = f"http://{args.host}:{args.port}{args.endpoint}"
-        base_url = f"http://{args.host}:{args.port}"
-
     tokenizer = get_tokenizer(tokenizer_id,
                               tokenizer_mode=tokenizer_mode,
                               trust_remote_code=args.trust_remote_code)
+    input_timestamps = None
 
     if args.dataset_name is None:
         raise ValueError(
@@ -640,15 +687,13 @@ def main(args: argparse.Namespace):
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
-            api_url=api_url,
-            base_url=base_url,
             model_id=model_id,
             model_name=model_name,
             tokenizer=tokenizer,
             input_requests=input_requests,
+            input_timestamps=input_timestamps,
             logprobs=args.logprobs,
             request_rate=args.request_rate,
-            burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
             selected_percentile_metrics=args.percentile_metrics.split(","),
@@ -791,22 +836,10 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, "
         "then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process or gamma distribution "
-        "to synthesize the request arrival times.",
+        "Otherwise, we use Poisson process to synthesize "
+        "the request arrival times.",
     )
-    parser.add_argument(
-        "--burstiness",
-        type=float,
-        default=1.0,
-        help="Burstiness factor of the request generation. "
-        "Only take effect when request_rate is not inf. "
-        "Default value is 1, which follows Poisson process. "
-        "Otherwise, the request intervals follow a gamma distribution. "
-        "A lower burstiness value (0 < burstiness < 1) results in more "
-        "bursty requests. A higher burstiness value (burstiness > 1) "
-        "results in a more uniform arrival of requests.",
-    )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0xCADE)
     parser.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -886,6 +919,22 @@ if __name__ == "__main__":
         "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
 
+    hf_group = parser.add_argument_group("hf dataset options")
+    hf_group.add_argument("--hf-subset",
+                          type=str,
+                          default=None,
+                          help="Subset of the HF dataset.")
+    hf_group.add_argument("--hf-split",
+                          type=str,
+                          default=None,
+                          help="Split of the HF dataset.")
+    hf_group.add_argument(
+        "--hf-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the output lengths "
+        "from the sampled HF dataset.",
+    )
     # group for dataset specific arguments
     sonnet_group = parser.add_argument_group("sonnet dataset options")
     sonnet_group.add_argument(
@@ -948,22 +997,14 @@ if __name__ == "__main__":
         " context. The length range of context in a random "
         " request is [random-prefix-len, "
         " random-prefix-len + random-prefix-len * random-range-ratio).")
-
-    hf_group = parser.add_argument_group("hf dataset options")
-    hf_group.add_argument("--hf-subset",
-                          type=str,
-                          default=None,
-                          help="Subset of the HF dataset.")
-    hf_group.add_argument("--hf-split",
-                          type=str,
-                          default=None,
-                          help="Split of the HF dataset.")
-    hf_group.add_argument(
-        "--hf-output-len",
+    
+    random_group.add_argument(
+        "--input-lens",
         type=int,
-        default=None,
-        help="Output length for each request. Overrides the output lengths "
-        "from the sampled HF dataset.",
+        nargs='+',
+        default=[],  # Default list of possible input lengths
+        help="List of possible input lengths to use for generating random requests. "
+            "Specify multiple values to define varying input lengths."
     )
 
     parser.add_argument(
