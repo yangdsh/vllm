@@ -278,7 +278,7 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            if data["choices"][0]["text"] or True:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:
@@ -292,7 +292,8 @@ async def async_request_openai_completions(
                                                       most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                if data["choices"][0]["text"]:
+                                    generated_text += data["choices"][0]["text"]
                     if first_chunk_received:
                         output.success = True
                     else:

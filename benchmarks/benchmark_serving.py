@@ -260,32 +260,6 @@ def sample_hf_requests(
     return sampled_requests
 
 def sample_burstgpt_request(
-    dataset_path: str,
-    num_requests: int,
-    tokenizer,
-    max_seqlen:int,
-):
-    data = pd.read_csv(dataset_path)
-    request_tokens = data['Request tokens'].tolist()
-    response_tokens = data['Response tokens'].tolist()
-    num_prompts_sampled = min(num_requests, len(data))
-    sampled_ids = random.sample(range(len(request_tokens)), num_prompts_sampled)
-    random.shuffle(sampled_ids)
-    # sampled_ids = range(num_prompts_sampled)
-    prompt_lens = []
-    response_lens = []
-    input_requests = []
-    for idx in sampled_ids:
-        if request_tokens[idx] + response_tokens[idx] < max_seqlen and \
-            request_tokens[idx] > 0 and response_tokens[idx] > 0:
-            prompt_lens.append(request_tokens[idx])
-            response_lens.append(response_tokens[idx])
-            prompt = tokenizer.decode([20]*request_tokens[idx])
-            input_requests.append((prompt, request_tokens[idx],
-                               response_tokens[idx], None))
-    return input_requests
-
-def sample_requests_from_csv(
     csv_file_path: str,  # Path to the CSV file
     prefix_len: int,
     input_len_range: Optional[List[int]],
@@ -309,7 +283,8 @@ def sample_requests_from_csv(
     """
     if not args.time_scale:
         raise(ValueError, "csv requires args.time_scale")
-    print('time_scale will override request_rate')
+    if args.time_scale != 0:
+        print('time_scale will override request_rate')
 
     # Read input lengths from the CSV file
     input_lens = []
@@ -403,12 +378,12 @@ async def get_request(
     #     raise ValueError("have time_scale in arguments without input_timestamps")
     input_requests = iter(input_requests)
     for i, request in enumerate(input_requests):
-        yield request
         # Sample the request interval from the exponential distribution.
-
         if input_timestamps and i+1 < len(input_timestamps):
+            yield request, input_timestamps[i]
             interval = input_timestamps[i+1] - input_timestamps[i]
         else:
+            yield request, i
             # interval = np.random.exponential(1.0 / request_rate)
             if request_rate == float("inf"):
                 # If the request rate is infinity, then we don't need to wait.
@@ -525,11 +500,14 @@ def calculate_metrics(
 
 class ServerStat:
     count: int
+    promt_len: int
     prompt_lens: list
     ttft: float
+    running_prompt_lens: list
     def __init__(self):
         self.count = 0
         self.prompt_lens = []
+        self.running_prompt_lens = []
         self.ttft = 0
         self.prompt_len = 0
 
@@ -551,10 +529,10 @@ async def benchmark(
     max_concurrency: Optional[int],
 ):
     server_stats = {}
-    
+    api_url_short_prompts = f"http://{args.hosts[0]}:{args.ports[0]}{args.endpoint}"
+    api_url_long_prompts = f"http://{args.hosts[1]}:{args.ports[1]}{args.endpoint}"
+
     def get_api_url(prompt_len):    
-        api_url_short_prompts = f"http://{args.host}:{args.port}{args.endpoint}"
-        api_url_long_prompts = f"http://localhost:{args.port}{args.endpoint}"
         # the first run
         if api_url_short_prompts not in server_stats:
             server_stats[api_url_short_prompts] = ServerStat()
@@ -567,18 +545,25 @@ async def benchmark(
         else:
             if prompt_len > args.prompt_len_threshold:
                 return api_url_long_prompts
-            #elif server_stats[api_url_long_prompts].prompt_len <= \
-            #    server_stats[api_url_short_prompts].prompt_len:
-            elif server_stats[api_url_long_prompts].count <= \
+            elif server_stats[api_url_long_prompts].prompt_len <= \
+                server_stats[api_url_short_prompts].prompt_len and \
+                server_stats[api_url_long_prompts].count <= \
                 server_stats[api_url_short_prompts].count / 2:
                 return api_url_long_prompts
             else:
                 return api_url_short_prompts
-                
+
+    def get_api_url_then_update_stat(prompt_len):
+        server = get_api_url(prompt_len)
+        server_stats[server].count += 1
+        server_stats[server].prompt_len += prompt_len
+        # print('dispatch', server_stats[server].count, server_stats[server].prompt_len)
+        server_stats[server].running_prompt_lens.append(server_stats[server].prompt_len)
+        return server
 
     def get_base_url(server):
-        base_url_short_prompts = f"http://{args.host}:{args.port}"
-        base_url_long_prompts = f"http://localhost:{args.port}"
+        base_url_short_prompts = f"http://{args.hosts[0]}:{args.ports[0]}"
+        base_url_long_prompts = f"http://{args.hosts[1]}:{args.ports[1]}"
         if server == 0:
             return base_url_short_prompts
         else:
@@ -598,15 +583,14 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input,
                                       pbar=pbar)
         async with semaphore:
-            server = request_func_input.api_url
-            server_stats[server].count += 1
-            server_stats[server].prompt_len += request_func_input.prompt_len
-            # server_stats[server].approx_prompt_len
+            server = get_api_url_then_update_stat(request_func_input.prompt_len)
+            request_func_input.api_url = server
             result = await request_func(request_func_input=request_func_input,
                                       pbar=pbar)
             result.server = server
             server_stats[server].count -= 1
             server_stats[server].prompt_len -= request_func_input.prompt_len
+            # print('done', server_stats[server].count, server_stats[server].prompt_len)
             server_stats[server].ttft = (server_stats[server].ttft + result.ttft) * 0.5
             # print(server, server_stats[server].count, result.ttft, request_func_input.prompt_len)
             return result
@@ -616,7 +600,7 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
+    '''print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
         input_requests[0])
     # print(input_requests[0])
@@ -627,7 +611,7 @@ async def benchmark(
     test_input = RequestFuncInput(
         model=model_id,
         prompt=test_prompt,
-        api_url=get_api_url(test_prompt_len),
+        api_url=api_url_short_prompts, # update later
         prompt_len=test_prompt_len,
         output_len=test_output_len,
         logprobs=logprobs,
@@ -642,7 +626,9 @@ async def benchmark(
             f"are correctly specified. Error: {test_output.error}")
     else:
         print("Initial test run completed. Starting main benchmark run...")
+    '''
 
+    # this is for torch profiler, by default not used
     if profile:
         print("Starting profiler...")
         for server in [0, 1]:
@@ -664,11 +650,12 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, input_timestamps):
+    async for request, current_timestamp in get_request(input_requests, request_rate, input_timestamps):
         prompt, prompt_len, output_len, mm_content = request
+        prompt_len *= args.prompt_len_scale
         request_func_input = RequestFuncInput(model=model_id,
                                               prompt=prompt,
-                                              api_url=get_api_url(prompt_len),
+                                              api_url=api_url_short_prompts, # update later,
                                               prompt_len=prompt_len,
                                               output_len=output_len,
                                               logprobs=logprobs,
@@ -741,12 +728,16 @@ async def benchmark(
         "total_token_throughput": metrics.total_token_throughput,
         "output_lens": actual_output_lens,
         "input_lens": [output.prompt_len for output in outputs],
-        "input_lens_localhost": [output.prompt_len for output in outputs if 'localhost' in output.server],
-        "input_lens_otherhost": [output.prompt_len for output in outputs if 'localhost' not in output.server],
+        "input_lens_host1": [output.prompt_len for output in outputs if args.hosts[0] in output.server],
+        "input_lens_host2": [output.prompt_len for output in outputs if args.hosts[0] not in output.server],
+        "running_lens_host1": server_stats[api_url_short_prompts].running_prompt_lens,
+        "running_lens_host2": server_stats[api_url_long_prompts].running_prompt_lens,
         "ttfts": [output.ttft for output in outputs],
-        "ttfts_localhost": [output.ttft for output in outputs if 'localhost' in output.server],
-        "ttfts_otherhost": [output.ttft for output in outputs if 'localhost' not in output.server],
+        "ttfts_host1": [output.ttft for output in outputs if args.hosts[0] in output.server],
+        "ttfts_host2": [output.ttft for output in outputs if args.hosts[0] not in output.server],
         "itls": [output.itl for output in outputs],
+        "itls_host1": [output.itl for output in outputs if args.hosts[0] in output.server],
+        "itls_host2": [output.itl for output in outputs if args.hosts[0] not in output.server],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
@@ -915,15 +906,8 @@ def main(args: argparse.Namespace):
             input_ratios=args.input_ratios,
             tokenizer=tokenizer,
         )
-    elif args.dataset_name == "burstgpt":
-        input_requests = sample_burstgpt_request(
-            dataset_path = args.csv_file_path,
-            max_seqlen=args.input_lens[1],
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-        )
-    elif args.dataset_name == "csv":
-        input_requests, input_timestamps = sample_requests_from_csv(
+    elif args.dataset_name == "csv" or args.dataset_name == "burstgpt":
+        input_requests, input_timestamps = sample_burstgpt_request(
             csv_file_path = args.csv_file_path,
             prefix_len=args.random_prefix_len,
             input_len_range=args.input_lens,
@@ -1018,8 +1002,8 @@ if __name__ == "__main__":
         default=None,
         help="Server or API base url if not using http host and port.",
     )
-    parser.add_argument("--host", type=str, default="localhost", help="address of another vllm instance")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--hosts", type=str, default="localhost,localhost", help="address of another vllm instance")
+    parser.add_argument("--ports", type=str, default="8000,8000")
     parser.add_argument(
         "--endpoint",
         type=str,
@@ -1286,8 +1270,15 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="csv of input lens.")
+
     random_group.add_argument(
         "--time-scale",
+        type=float,
+        default=None,
+        help="speed up requests by time_scale.")
+    
+    random_group.add_argument(
+        "--prompt-len-scale",
         type=float,
         default=None,
         help="speed up requests by time_scale.")
@@ -1299,4 +1290,10 @@ if __name__ == "__main__":
         help="prompts shorter than this will be handled by another vllm instance.")
 
     args = parser.parse_args()
+    args.hosts = args.hosts.split(',')
+    args.ports = args.ports.split(',')
+    if len(args.hosts) == 1:
+        args.hosts = [args.hosts[0], args.hosts[0]]
+        args.ports = [args.ports[0], args.ports[0]]
+    args.prompt_len_threshold *= args.prompt_len_scale
     main(args)
