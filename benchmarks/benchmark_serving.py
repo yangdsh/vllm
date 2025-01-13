@@ -1,1037 +1,667 @@
 # SPDX-License-Identifier: Apache-2.0
-r"""Benchmark online serving throughput.
-
-On the server side, run one of the following commands:
-    vLLM OpenAI API server
-    vllm serve <your_model> \
-        --swap-space 16 \
-        --disable-log-requests
-
-    (TGI backend)
-    ./launch_tgi_server.sh <your_model> <max_batch_total_tokens>
-
-On the client side, run:
-    python benchmarks/benchmark_serving.py \
-        --backend <backend> \
-        --model <your_model> \
-        --dataset-name sharegpt \
-        --dataset-path <path to dataset> \
-        --request-rate <request_rate> \ # By default <request_rate> is inf
-        --num-prompts <num_prompts> # By default <num_prompts> is 1000
-
-    when using tgi backend, add
-        --endpoint /generate_stream
-    to the end of the command above.
 """
-import argparse
-import asyncio
-import gc
+This module defines a framework for sampling benchmark requests from various
+datasets. Each dataset subclass of BenchmarkDataset must implement sample
+generation. Supported dataset types include:
+  - ShareGPT
+  - Random (synthetic)
+  - Sonnet
+  - BurstGPT
+  - HuggingFace
+  - VisionArena
+
+TODO: Implement CustomDataset to parse a JSON file and convert its contents into
+SampleRequest instances, similar to the approach used in ShareGPT.
+"""
+
+import base64
+import io
 import json
-import os
-import csv
 import random
-import time
-import warnings
-from collections.abc import AsyncGenerator, Iterable
+from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Optional
+from functools import cache
+from typing import Any, Optional, Union
 
 import numpy as np
 import pandas as pd
-from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
-                                  RequestFuncOutput)
-from tqdm.asyncio import tqdm
+from datasets import load_dataset
+from PIL import Image
 from transformers import PreTrainedTokenizerBase
 
-try:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
-except ImportError:
-    from backend_request_func import get_tokenizer
+from vllm.lora.request import LoRARequest
+from vllm.lora.utils import get_adapter_absolute_path
+from vllm.multimodal import MultiModalDataDict
+from vllm.transformers_utils.tokenizer import AnyTokenizer, get_lora_tokenizer
 
-try:
-    from vllm.utils import FlexibleArgumentParser
-except ImportError:
-    from argparse import ArgumentParser as FlexibleArgumentParser
+# -----------------------------------------------------------------------------
+# Data Classes
+# -----------------------------------------------------------------------------
 
-from benchmark_dataset import (BurstGPTDataset, HuggingFaceDataset,
-                               RandomDataset, SampleRequest, ShareGPTDataset,
-                               SonnetDataset, VisionArenaDataset)
-from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
-
-MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 @dataclass
-class BenchmarkMetrics:
-    completed: int
-    total_input: int
-    total_output: int
-    request_throughput: float
-    request_goodput: float
-    output_throughput: float
-    total_token_throughput: float
-    mean_ttft_ms: float
-    median_ttft_ms: float
-    std_ttft_ms: float
-    percentiles_ttft_ms: list[tuple[float, float]]
-    mean_tpot_ms: float
-    median_tpot_ms: float
-    std_tpot_ms: float
-    percentiles_tpot_ms: list[tuple[float, float]]
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
-    percentiles_itl_ms: list[tuple[float, float]]
-    # E2EL stands for end-to-end latency per request.
-    # It is the time taken on the client side from sending
-    # a request to receiving a complete response.
-    mean_e2el_ms: float
-    median_e2el_ms: float
-    std_e2el_ms: float
-    percentiles_e2el_ms: list[tuple[float, float]]
-
-
-async def get_request(
-    input_requests: list[SampleRequest],
-    request_rate: float,
-    burstiness: float = 1.0,
-) -> AsyncGenerator[SampleRequest, None]:
+class SampleRequest:
     """
-    Asynchronously generates requests at a specified rate
-    with OPTIONAL burstiness.
-
-    Args:
-        input_requests:
-            A list of input requests, each represented as a SampleRequest.
-        request_rate:
-            The rate at which requests are generated (requests/s).
-        burstiness (optional):
-            The burstiness factor of the request generation.
-            Only takes effect when request_rate is not inf.
-            Default value is 1, which follows a Poisson process.
-            Otherwise, the request intervals follow a gamma distribution.
-            A lower burstiness value (0 < burstiness < 1) results
-            in more bursty requests, while a higher burstiness value
-            (burstiness > 1) results in a more uniform arrival of requests.
+    Represents a single inference request for benchmarking.
     """
-    input_requests: Iterable[SampleRequest] = iter(input_requests)
 
-    # Calculate scale parameter theta to maintain the desired request_rate.
-    assert burstiness > 0, (
-        f"A positive burstiness factor is expected, but given {burstiness}.")
-    theta = 1.0 / (request_rate * burstiness)
-
-    for request in input_requests:
-        yield request
-        # Sample the request interval from the exponential distribution.
-
-        if input_timestamps and i+1 < len(input_timestamps):
-            interval = input_timestamps[i+1] - input_timestamps[i]
-        else:
-            # interval = np.random.exponential(1.0 / request_rate)
-            if request_rate == float("inf"):
-                # If the request rate is infinity, then we don't need to wait.
-                continue
-            interval = 1.0 / request_rate
-
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
+    prompt: str
+    prompt_len: int
+    expected_output_len: int
+    multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
+    lora_request: Optional[LoRARequest] = None
 
 
-def calculate_metrics(
-    input_requests: list[SampleRequest],
-    outputs: list[RequestFuncOutput],
-    dur_s: float,
-    tokenizer: PreTrainedTokenizerBase,
-    selected_percentile_metrics: list[str],
-    selected_percentiles: list[float],
-    goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int]]:
-    actual_output_lens: list[int] = []
-    total_input = 0
-    completed = 0
-    good_completed = 0
-    itls: list[float] = []
-    tpots: list[float] = []
-    all_tpots: list[float] = []
-    ttfts: list[float] = []
-    e2els: list[float] = []
-    for i in range(len(outputs)):
-        if outputs[i].success:
-            output_len = outputs[i].output_tokens
-
-            if output_len is None:
-                # We use the tokenizer to count the number of output tokens
-                # for some serving backends instead of looking at
-                # len(outputs[i].itl) since multiple output tokens may be
-                # bundled together
-                # Note : this may inflate the output token count slightly
-                output_len = len(
-                    tokenizer(outputs[i].generated_text,
-                              add_special_tokens=False).input_ids)
-            actual_output_lens.append(output_len)
-            total_input += input_requests[i].prompt_len
-            tpot = 0
-            if output_len > 1:
-                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
-                tpot = latency_minus_ttft / (output_len - 1)
-                tpots.append(tpot)
-            # Note: if output_len <= 1, we regard tpot as 0 for goodput
-            all_tpots.append(tpot)
-            itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
-            e2els.append(outputs[i].latency)
-            completed += 1
-        else:
-            actual_output_lens.append(0)
-
-    if goodput_config_dict:
-        valid_metrics = []
-        slo_values = []
-
-        if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
-            slo_values.append(goodput_config_dict["ttft"] /
-                              MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "tpot" in goodput_config_dict:
-            valid_metrics.append(all_tpots)
-            slo_values.append(goodput_config_dict["tpot"] /
-                              MILLISECONDS_TO_SECONDS_CONVERSION)
-        if "e2el" in goodput_config_dict:
-            valid_metrics.append(e2els)
-            slo_values.append(goodput_config_dict["e2el"] /
-                              MILLISECONDS_TO_SECONDS_CONVERSION)
-
-        for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
-            if is_good_req:
-                good_completed += 1
-
-    if completed == 0:
-        warnings.warn(
-            "All requests failed. This is likely due to a misconfiguration "
-            "on the benchmark arguments.",
-            stacklevel=2)
-    metrics = BenchmarkMetrics(
-        completed=completed,
-        total_input=total_input,
-        total_output=sum(actual_output_lens),
-        request_throughput=completed / dur_s,
-        request_goodput=good_completed / dur_s,
-        output_throughput=sum(actual_output_lens) / dur_s,
-        total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) *
-        1000,  # ttfts is empty if streaming is not supported by backend
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
-                             for p in selected_percentiles],
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or 0, p) * 1000)
-                             for p in selected_percentiles],
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000)
-                            for p in selected_percentiles],
-        mean_e2el_ms=np.median(e2els or 0) * 1000,
-        std_e2el_ms=np.std(e2els or 0) * 1000,
-        median_e2el_ms=np.mean(e2els or 0) * 1000,
-        percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
-                             for p in selected_percentiles],
-    )
-
-    return metrics, actual_output_lens
+# -----------------------------------------------------------------------------
+# Benchmark Dataset Base Class
+# -----------------------------------------------------------------------------
 
 
-class ServerStat:
-    count: int
-    prompt_lens: list
-    ttft: float
-    def __init__(self):
-        self.count = 0
-        self.prompt_lens = []
-        self.ttft = 0
-        self.prompt_len = 0
+class BenchmarkDataset(ABC):
+    DEFAULT_SEED = 0
 
-async def benchmark(
-    backend: str,
-    model_id: str,
-    model_name: str,
-    tokenizer: PreTrainedTokenizerBase,
-    input_requests: list[SampleRequest],
-    logprobs: Optional[int],
-    request_rate: float,
-    disable_tqdm: bool,
-    profile: bool,
-    selected_percentile_metrics: list[str],
-    selected_percentiles: list[float],
-    ignore_eos: bool,
-    goodput_config_dict: dict[str, float],
-    max_concurrency: Optional[int],
-    lora_modules: Optional[Iterable[str]],
-):
-    server_stats = {}
-    
-    def get_api_url(prompt_len):    
-        api_url_short_prompts = f"http://{args.host}:{args.port}{args.endpoint}"
-        api_url_long_prompts = f"http://localhost:{args.port}{args.endpoint}"
-        # the first run
-        if api_url_short_prompts not in server_stats:
-            server_stats[api_url_short_prompts] = ServerStat()
-            server_stats[api_url_long_prompts] = ServerStat()
-            return api_url_short_prompts if prompt_len < args.prompt_len_threshold else api_url_long_prompts
+    # num_requests has default 1000 in both the benchmark_serving.py and
+    # benchmark_throughput.py
 
-        if args.prompt_len_threshold == -1:
-            # return api_url_short_prompts if server_stats[api_url_short_prompts].count < server_stats[api_url_long_prompts].count else api_url_long_prompts
-            return api_url_short_prompts if server_stats[api_url_short_prompts].prompt_len < server_stats[api_url_long_prompts].prompt_len else api_url_long_prompts
-        else:
-            if prompt_len > args.prompt_len_threshold:
-                return api_url_long_prompts
-            #elif server_stats[api_url_long_prompts].prompt_len <= \
-            #    server_stats[api_url_short_prompts].prompt_len:
-            elif server_stats[api_url_long_prompts].count <= \
-                server_stats[api_url_short_prompts].count / 2:
-                return api_url_long_prompts
-            else:
-                return api_url_short_prompts
-                
+    def __init__(
+        self,
+        dataset_path: Optional[str] = None,
+        random_seed: int = DEFAULT_SEED,
+    ) -> None:
+        """
+        Initialize the BenchmarkDataset with an optional dataset path and random
+        seed.  Args:
+            dataset_path (Optional[str]): Path to the dataset. If None, it
+            indicates that a default or random dataset might be used.
+            random_seed (int): Seed value for reproducible shuffling or
+            sampling. Defaults to DEFAULT_SEED.
+        """
+        self.dataset_path = dataset_path
+        # Set the random seed, ensuring that a None value is replaced with the
+        # default seed.
+        self.random_seed = (random_seed
+                            if random_seed is not None else self.DEFAULT_SEED)
+        self.data = None
 
-    def get_base_url(server):
-        base_url_short_prompts = f"http://{args.host}:{args.port}"
-        base_url_long_prompts = f"http://localhost:{args.port}"
-        if server == 0:
-            return base_url_short_prompts
-        else:
-            return base_url_long_prompts
-    
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    def load_data(self) -> None:
+        """
+        Load data from the dataset path into self.data.
+        
+        This method must be overridden by subclasses since the method to load
+        data will vary depending on the dataset format and source.
+        
+        Raises:
+            NotImplementedError: If a subclass does not implement this method.
+        """
+        # TODO (jenniferzhao): add support for downloading data
+        raise NotImplementedError(
+            "load_data must be implemented in subclasses.")
 
-    # This can be used once the minimum Python version is 3.10 or higher,
-    # and it will simplify the code in limited_request_func.
-    #    semaphore = (asyncio.Semaphore(max_concurrency)
-    #                 if max_concurrency else contextlib.nullcontext())
-    semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
+    def get_random_lora_request(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        max_loras: Optional[int] = None,
+        lora_path: Optional[str] = None,
+    ) -> tuple[Optional[LoRARequest], AnyTokenizer]:
+        """
+        Optionally select a random LoRA request and return its associated
+        tokenizer.
+        
+        This method is used when LoRA parameters are provided.  It randomly
+        selects a LoRA based on max_loras and retrieves a cached tokenizer for
+        that LoRA if available. Otherwise, it returns the base tokenizer.
+        
+        Args:
+            tokenizer (PreTrainedTokenizerBase): The base tokenizer to use if no
+            LoRA is selected.  max_loras (Optional[int]): The maximum number of
+            LoRAs available. If None, LoRA is not used.  lora_path
+            (Optional[str]): Path to the LoRA parameters on disk. If None, LoRA
+            is not used.
+        
+        Returns:
+            tuple[Optional[LoRARequest], AnyTokenizer]: A tuple where the first
+            element is a LoRARequest (or None if not applicable) and the second
+            element is the tokenizer associated with the LoRA request (or the
+            base tokenizer).
+        """
+        if max_loras is None or lora_path is None:
+            return None, tokenizer
 
-    async def limited_request_func(request_func_input, pbar):
-        if semaphore is None:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
-        async with semaphore:
-            server = request_func_input.api_url
-            server_stats[server].count += 1
-            server_stats[server].prompt_len += request_func_input.prompt_len
-            # server_stats[server].approx_prompt_len
-            result = await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
-            result.server = server
-            server_stats[server].count -= 1
-            server_stats[server].prompt_len -= request_func_input.prompt_len
-            server_stats[server].ttft = (server_stats[server].ttft + result.ttft) * 0.5
-            # print(server, server_stats[server].count, result.ttft, request_func_input.prompt_len)
-            return result
-    
-    if backend in ASYNC_REQUEST_FUNCS:
-        request_func = ASYNC_REQUEST_FUNCS[backend]
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
-
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len, test_mm_content = \
-        input_requests[0].prompt, input_requests[0].prompt_len, \
-        input_requests[0].expected_output_len, \
-            input_requests[0].multi_modal_data
-
-    if backend != "openai-chat" and test_mm_content is not None:
-        # multi-modal benchmark is only available on OpenAI Chat backend.
-        raise ValueError(
-            "Multi-modal content is only supported on 'openai-chat' backend.")
-    assert test_mm_content is None or isinstance(test_mm_content, dict)
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=get_api_url(test_prompt_len),
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-    )
-
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
-
-    if lora_modules:
-        # For each input request, choose a LoRA module at random.
-        lora_modules = iter(
-            [random.choice(lora_modules) \
-                for _ in range(len(input_requests))])
-
-    if profile:
-        print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                         model_name=model_name,
-                                         prompt=test_prompt,
-                                         api_url=base_url + "/start_profile",
-                                         prompt_len=test_prompt_len,
-                                         output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         multi_modal_content=test_mm_content,
-                                         ignore_eos=ignore_eos)
-        profile_output = await request_func(request_func_input=profile_input)
-        if profile_output.success:
-            print("Profiler started")
-
-    print(f"Traffic request rate: {request_rate}")
-    print(f"Maximum request concurrency: {max_concurrency}")
-
-    benchmark_start_time = time.perf_counter()
-    tasks: list[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request.prompt, \
-            request.prompt_len, request.expected_output_len, \
-                request.multi_modal_data
-        req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
-
-        request_func_input = RequestFuncInput(model=req_model_id,
-                                              model_name=req_model_name,
-                                              prompt=prompt,
-                                              api_url=get_api_url(prompt_len),
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              logprobs=logprobs,
-                                              multi_modal_content=mm_content,
-                                              ignore_eos=ignore_eos)
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input,
-                                     pbar=pbar)))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
-
-    if profile:
-        print("Stopping profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            prompt=test_prompt,
-            api_url=base_url + "/stop_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
+        # Generate a random LoRA ID in the range [1, max_loras].
+        lora_id = random.randint(1, max_loras)
+        lora_request = LoRARequest(
+            lora_name=str(lora_id),
+            lora_int_id=lora_id,
+            lora_path=lora_path_on_disk(lora_path),
         )
-        profile_output = await request_func(request_func_input=profile_input)
-        if profile_output.success:
-            print("Profiler stopped")
+        if lora_id not in lora_tokenizer_cache:
+            lora_tokenizer_cache[lora_id] = get_lora_tokenizer(lora_request)
+        # Return lora_request and the cached tokenizer if available; otherwise,
+        # return the base tokenizer
+        return lora_request, lora_tokenizer_cache[lora_id] or tokenizer
 
-    if pbar is not None:
-        pbar.close()
-
-    benchmark_duration = time.perf_counter() - benchmark_start_time
-
-    metrics, actual_output_lens = calculate_metrics(
-        input_requests=input_requests,
-        outputs=outputs,
-        dur_s=benchmark_duration,
-        tokenizer=tokenizer,
-        selected_percentile_metrics=selected_percentile_metrics,
-        selected_percentiles=selected_percentiles,
-        goodput_config_dict=goodput_config_dict,
-    )
-
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:",
-                                 metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
-    if goodput_config_dict:
-        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
-                                        metrics.request_goodput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
-    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
-                                    metrics.total_token_throughput))
-
-    result = {
-        "duration": benchmark_duration,
-        "completed": metrics.completed,
-        "total_input_tokens": metrics.total_input,
-        "total_output_tokens": metrics.total_output,
-        "request_throughput": metrics.request_throughput,
-        "request_goodput:":
-        metrics.request_goodput if goodput_config_dict else None,
-        "output_throughput": metrics.output_throughput,
-        "total_token_throughput": metrics.total_token_throughput,
-        "output_lens": actual_output_lens,
-        "input_lens": [output.prompt_len for output in outputs],
-        "input_lens_localhost": [output.prompt_len for output in outputs if 'localhost' in output.server],
-        "input_lens_otherhost": [output.prompt_len for output in outputs if 'localhost' not in output.server],
-        "ttfts": [output.ttft for output in outputs],
-        "ttfts_localhost": [output.ttft for output in outputs if 'localhost' in output.server],
-        "ttfts_otherhost": [output.ttft for output in outputs if 'localhost' not in output.server],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-    }
-
-    def process_one_metric(
-        # E.g., "ttft"
-        metric_attribute_name: str,
-        # E.g., "TTFT"
-        metric_name: str,
-        # E.g., "Time to First Token"
-        metric_header: str,
-    ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
-            return
-        print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
-        print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
-            p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
-
-    process_one_metric("ttft", "TTFT", "Time to First Token")
-    process_one_metric("tpot", "TPOT",
-                       "Time per Output Token (excl. 1st token)")
-    process_one_metric("itl", "ITL", "Inter-token Latency")
-    process_one_metric("e2el", "E2EL", "End-to-end Latency")
-
-    print("=" * 50)
-
-    return result
+    @abstractmethod
+    def sample(self, tokenizer: PreTrainedTokenizerBase,
+               num_requests: int) -> list[SampleRequest]:
+        """
+        Abstract method to generate sample requests from the dataset.
+        
+        Subclasses must override this method to implement dataset-specific logic
+        for generating a list of SampleRequest objects.
+        
+        Args:
+            tokenizer (PreTrainedTokenizerBase): The tokenizer to be used
+             for processing the dataset's text.
+            num_requests (int): The number of sample requests to generate.
+        
+        Returns:
+            list[SampleRequest]: A list of sample requests generated from the
+            dataset.
+        """
+        raise NotImplementedError("sample must be implemented in subclasses.")
 
 
-def check_goodput_args(args):
-    # Check and parse goodput arguments
-    goodput_config_dict = {}
-    VALID_NAMES = ["ttft", "tpot", "e2el"]
-    if args.goodput:
-        goodput_config_dict = parse_goodput(args.goodput)
-        for slo_name, slo_val in goodput_config_dict.items():
-            if slo_name not in VALID_NAMES:
-                raise ValueError(
-                    f"Invalid metric name found, {slo_name}: {slo_val}. "
-                    "The service level objective name should be one of "
-                    f"{str(VALID_NAMES)}. ")
-            if slo_val < 0:
-                raise ValueError(
-                    f"Invalid value found, {slo_name}: {slo_val}. "
-                    "The service level objective value should be "
-                    "non-negative.")
-    return goodput_config_dict
+# -----------------------------------------------------------------------------
+# Utility Functions and Global Caches
+# -----------------------------------------------------------------------------
 
 
-def parse_goodput(slo_pairs):
-    goodput_config_dict = {}
-    try:
-        for slo_pair in slo_pairs:
-            slo_name, slo_val = slo_pair.split(":")
-            goodput_config_dict[slo_name] = float(slo_val)
-    except ValueError as err:
-        raise argparse.ArgumentTypeError(
-            "Invalid format found for service level objectives. "
-            "Specify service level objectives for goodput as \"KEY:VALUE\" "
-            "pairs, where the key is a metric name, and the value is a "
-            "number in milliseconds.") from err
-    return goodput_config_dict
+def is_valid_sequence(
+    prompt_len: int,
+    output_len: int,
+    min_len: int = 4,
+    max_prompt_len: int = 1024,
+    max_total_len: int = 2048,
+    skip_min_output_len_check: bool = False,
+) -> bool:
+    """
+    Validate a sequence based on prompt and output lengths.
+
+    Default pruning criteria are copied from the original `sample_hf_requests`
+    and `sample_sharegpt_requests` functions in benchmark_serving.py, as well as
+    from `sample_requests` in benchmark_throughput.py.
+    """
+    # Check for invalid conditions
+    prompt_too_short = prompt_len < min_len
+    output_too_short = (not skip_min_output_len_check) and (output_len
+                                                            < min_len)
+    prompt_too_long = prompt_len > max_prompt_len
+    combined_too_long = (prompt_len + output_len) > max_total_len
+
+    # Return True if none of the invalid conditions are met
+    return not (prompt_too_short or output_too_short or prompt_too_long
+                or combined_too_long)
 
 
-def save_to_pytorch_benchmark_format(args: argparse.Namespace,
-                                     results: dict[str, Any],
-                                     file_name: str) -> None:
-    metrics = [
-        "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
-        "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
-    ]
-    # These raw data might be useful, but they are rather big. They can be added
-    # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
-    pt_records = convert_to_pytorch_benchmark_format(
-        args=args,
-        metrics={k: [results[k]]
-                 for k in metrics},
-        extra_info={
-            k: results[k]
-            for k in results if k not in metrics and k not in ignored_metrics
-        })
-    if pt_records:
-        # Don't use json suffix here as we don't want CI to pick it up
-        pt_file = f"{os.path.splitext(file_name)[0]}.pytorch.json"
-        write_to_json(pt_file, pt_records)
+@cache
+def lora_path_on_disk(lora_path: str) -> str:
+    return get_adapter_absolute_path(lora_path)
 
 
-def main(args: argparse.Namespace):
-    # print(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+# Global cache for LoRA tokenizers.
+lora_tokenizer_cache: dict[int, AnyTokenizer] = {}
 
-    backend = args.backend
-    model_id = args.model
-    model_name = args.served_model_name
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
-    tokenizer_mode = args.tokenizer_mode
 
-    tokenizer = get_tokenizer(tokenizer_id,
-                              tokenizer_mode=tokenizer_mode,
-                              trust_remote_code=args.trust_remote_code)
-    input_timestamps = None
+def process_image(image: Any) -> Mapping[str, Any]:
+    """
+    Process a single image input and return a multimedia content dictionary.
 
-    if args.dataset_name is None:
-        raise ValueError(
-            "Please specify '--dataset-name' and the corresponding "
-            "'--dataset-path' if required.")
+    For a PIL.Image.Image input:
+      - Converts the image to RGB.
+      - Saves the image as a JPEG in-memory.
+      - Encodes the JPEG data as a base64 string.
+      - Returns a dictionary with the image as a base64 data URL.
 
-    if args.dataset_name == "sonnet":
-        dataset = SonnetDataset(dataset_path=args.dataset_path)
-        # For the "sonnet" dataset, formatting depends on the backend.
-        if args.backend == "openai-chat":
-            input_requests = dataset.sample(num_requests=args.num_prompts,
-                                            input_len=args.sonnet_input_len,
-                                            output_len=args.sonnet_output_len,
-                                            prefix_len=args.sonnet_prefix_len,
-                                            tokenizer=tokenizer,
-                                            return_prompt_formatted=False)
-        else:
-            assert tokenizer.chat_template or tokenizer.default_chat_template, (
-                "Tokenizer/model must have chat template for sonnet dataset.")
-            input_requests = dataset.sample(num_requests=args.num_prompts,
-                                            input_len=args.sonnet_input_len,
-                                            output_len=args.sonnet_output_len,
-                                            prefix_len=args.sonnet_prefix_len,
-                                            tokenizer=tokenizer,
-                                            return_prompt_formatted=True)
+    For a string input:
+      - Treats the string as a URL or file path.
+      - Prepends "file://" if the string doesn't start with "http://" or
+        "file://".
+      - Returns a dictionary with the image URL.
 
-    elif args.dataset_name == "hf":
-        # Choose between VisionArenaDataset
-        # and HuggingFaceDataset based on provided parameters.
-        dataset_class = (VisionArenaDataset if args.dataset_path
-                         == VisionArenaDataset.VISION_ARENA_DATASET_PATH
-                         and args.hf_subset is None else HuggingFaceDataset)
-        input_requests = dataset_class(
-            dataset_path=args.dataset_path,
-            dataset_subset=args.hf_subset,
-            dataset_split=args.hf_split,
-        ).sample(
-            num_requests=args.num_prompts,
-            tokenizer=tokenizer,
-            random_seed=args.seed,
-            output_len=args.hf_output_len,
-        )
-
-    else:
-        # For datasets that follow a similar structure, use a mapping.
-        dataset_mapping = {
-            "sharegpt":
-            lambda: ShareGPTDataset(random_seed=args.seed,
-                                    dataset_path=args.dataset_path).sample(
-                                        tokenizer=tokenizer,
-                                        num_requests=args.num_prompts,
-                                        output_len=args.sharegpt_output_len,
-                                    ),
-            "burstgpt":
-            lambda: BurstGPTDataset(random_seed=args.seed,
-                                    dataset_path=args.dataset_path).
-            sample(tokenizer=tokenizer, num_requests=args.num_prompts),
-            "random":
-            lambda: RandomDataset(dataset_path=args.dataset_path).sample(
-                tokenizer=tokenizer,
-                num_requests=args.num_prompts,
-                prefix_len=args.random_prefix_len,
-                input_len=args.random_input_len,
-                output_len=args.random_output_len,
-                range_ratio=args.random_range_ratio,
-            )
+    Raises:
+      ValueError: If the input is neither a PIL.Image.Image nor a string.
+    """
+    if isinstance(image, Image.Image):
+        image = image.convert("RGB")
+        with io.BytesIO() as image_data:
+            image.save(image_data, format="JPEG")
+            image_base64 = base64.b64encode(
+                image_data.getvalue()).decode("utf-8")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{image_base64}"
+            },
         }
 
-        try:
-            input_requests = dataset_mapping[args.dataset_name]()
-        except KeyError as err:
-            raise ValueError(f"Unknown dataset: {args.dataset_name}") from err
-    goodput_config_dict = check_goodput_args(args)
+    if isinstance(image, str):
+        image_url = (image if image.startswith(
+            ("http://", "file://")) else f"file://{image}")
+        return {"type": "image_url", "image_url": {"url": image_url}}
 
-    # Avoid GC processing "static" data - reduce pause times.
-    gc.collect()
-    gc.freeze()
-
-    benchmark_result = asyncio.run(
-        benchmark(
-            backend=backend,
-            model_id=model_id,
-            model_name=model_name,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            input_timestamps=input_timestamps,
-            logprobs=args.logprobs,
-            request_rate=args.request_rate,
-            disable_tqdm=args.disable_tqdm,
-            profile=args.profile,
-            selected_percentile_metrics=args.percentile_metrics.split(","),
-            selected_percentiles=[
-                float(p) for p in args.metric_percentiles.split(",")
-            ],
-            ignore_eos=args.ignore_eos,
-            goodput_config_dict=goodput_config_dict,
-            max_concurrency=args.max_concurrency,
-            lora_modules=args.lora_modules,
-        ))
-
-    # Save config and results to json
-    if args.save_result:
-        result_json: dict[str, Any] = {}
-
-        # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-        result_json["date"] = current_dt
-        result_json["backend"] = backend
-        result_json["model_id"] = model_id
-        result_json["tokenizer_id"] = tokenizer_id
-        result_json["num_prompts"] = args.num_prompts
-
-        # Metadata
-        if args.metadata:
-            for item in args.metadata:
-                if "=" in item:
-                    kvstring = item.split("=")
-                    result_json[kvstring[0].strip()] = kvstring[1].strip()
-                else:
-                    raise ValueError(
-                        "Invalid metadata format. Please use KEY=VALUE format."
-                    )
-
-        # Traffic
-        result_json["request_rate"] = (args.request_rate if args.request_rate
-                                       < float("inf") else "inf")
-        result_json["burstiness"] = args.burstiness
-        result_json["max_concurrency"] = args.max_concurrency
-
-        # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
-
-        # Save to file
-        base_model_id = model_id.split("/")[-1]
-        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
-                               if args.max_concurrency is not None else "")
-        file_name = f"{backend}-{args.request_rate}qps{max_concurrency_str}-{base_model_id}-{current_dt}.json"  #noqa
-        if args.result_filename:
-            file_name = args.result_filename
-        if args.result_dir:
-            file_name = os.path.join(args.result_dir, file_name)
-        with open(file_name, "w", encoding='utf-8') as outfile:
-            json.dump(result_json, outfile)
-        save_to_pytorch_benchmark_format(args, result_json, file_name)
+    raise ValueError(
+        f"Invalid image input {image}. Must be a PIL.Image.Image or str.")
 
 
-if __name__ == "__main__":
-    parser = FlexibleArgumentParser(
-        description="Benchmark the online serving throughput.")
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default="vllm",
-        choices=list(ASYNC_REQUEST_FUNCS.keys()),
-    )
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default=None,
-        help="Server or API base url if not using http host and port.",
-    )
-    # Use 127.0.0.1 here instead of localhost to force the use of ipv4
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--endpoint",
-        type=str,
-        default="/v1/completions",
-        help="API endpoint.",
-    )
-    parser.add_argument(
-        "--dataset-name",
-        type=str,
-        default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
-        help="Name of the dataset to benchmark on.",
-    )
-    parser.add_argument("--dataset-path",
-                        type=str,
-                        default=None,
-                        help="Path to the sharegpt/sonnet dataset. "
-                        "Or the huggingface dataset ID if using HF dataset.")
-    parser.add_argument(
-        "--max-concurrency",
-        type=int,
-        default=None,
-        help="Maximum number of concurrent requests. This can be used "
-        "to help simulate an environment where a higher level component "
-        "is enforcing a maximum number of concurrent requests. While the "
-        "--request-rate argument controls the rate at which requests are "
-        "initiated, this argument will control how many are actually allowed "
-        "to execute at a time. This means that when used in combination, the "
-        "actual request rate may be lower than specified with --request-rate, "
-        "if the server is not processing requests fast enough to keep up.")
+# -----------------------------------------------------------------------------
+# Random Dataset Implementation (Synthetic Data)
+# -----------------------------------------------------------------------------
 
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Name of the model.",
-    )
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        help=
-        "Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
-    )
-    parser.add_argument("--use-beam-search", action="store_true")
-    parser.add_argument(
-        "--num-prompts",
-        type=int,
-        default=1000,
-        help="Number of prompts to process.",
-    )
-    parser.add_argument(
-        "--logprobs",
-        type=int,
-        default=None,
-        help=("Number of logprobs-per-token to compute & return as part of "
-              "the request. If unspecified, then either (1) if beam search "
-              "is disabled, no logprobs are computed & a single dummy "
-              "logprob is returned for each token; or (2) if beam search "
-              "is enabled 1 logprob per token is computed"),
-    )
-    parser.add_argument(
-        "--request-rate",
-        type=float,
-        default=float("inf"),
-        help="Number of requests per second. If this is inf, "
-        "then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process to synthesize "
-        "the request arrival times.",
-    )
-    parser.add_argument("--seed", type=int, default=0xCADE)
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Trust remote code from huggingface",
-    )
-    parser.add_argument(
-        "--disable-tqdm",
-        action="store_true",
-        help="Specify to disable tqdm progress bar.",
-    )
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Use Torch Profiler. The endpoint must be launched with "
-        "VLLM_TORCH_PROFILER_DIR to enable profiler.",
-    )
-    parser.add_argument(
-        "--save-result",
-        action="store_true",
-        help="Specify to save benchmark results to a json file",
-    )
-    parser.add_argument(
-        "--metadata",
-        metavar="KEY=VALUE",
-        nargs="*",
-        help="Key-value pairs (e.g, --metadata version=0.3.3 tp=1) "
-        "for metadata of this run to be saved in the result JSON file "
-        "for record keeping purposes.",
-    )
-    parser.add_argument(
-        "--result-dir",
-        type=str,
-        default=None,
-        help="Specify directory to save benchmark json results."
-        "If not specified, results are saved in the current directory.",
-    )
-    parser.add_argument(
-        "--result-filename",
-        type=str,
-        default=None,
-        help="Specify the filename to save benchmark json results."
-        "If not specified, results will be saved in "
-        "{backend}-{args.request_rate}qps-{base_model_id}-{current_dt}.json"
-        " format.",
-    )
-    parser.add_argument(
-        "--ignore-eos",
-        action="store_true",
-        help="Set ignore_eos flag when sending the benchmark request."
-        "Warning: ignore_eos is not supported in deepspeed_mii and tgi.")
-    parser.add_argument(
-        "--percentile-metrics",
-        type=str,
-        default="ttft,tpot,itl",
-        help="Comma-seperated list of selected metrics to report percentils. "
-        "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
-        "Default value is \"ttft,tpot,itl\".")
-    parser.add_argument(
-        "--metric-percentiles",
-        type=str,
-        default="99",
-        help="Comma-seperated list of percentiles for selected metrics. "
-        "To report 25-th, 50-th, and 75-th percentiles, use \"25,50,75\". "
-        "Default value is \"99\". "
-        "Use \"--percentile-metrics\" to select metrics.",
-    )
-    parser.add_argument(
-        "--goodput",
-        nargs="+",
-        required=False,
-        help="Specify service level objectives for goodput as \"KEY:VALUE\" "
-        "pairs, where the key is a metric name, and the value is in "
-        "milliseconds. Multiple \"KEY:VALUE\" pairs can be provided, "
-        "separated by spaces. Allowed request level metric names are "
-        "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
-        "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
-        "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
 
-    hf_group = parser.add_argument_group("hf dataset options")
-    hf_group.add_argument("--hf-subset",
-                          type=str,
-                          default=None,
-                          help="Subset of the HF dataset.")
-    hf_group.add_argument("--hf-split",
-                          type=str,
-                          default=None,
-                          help="Split of the HF dataset.")
-    hf_group.add_argument(
-        "--hf-output-len",
-        type=int,
-        default=None,
-        help="Output length for each request. Overrides the output lengths "
-        "from the sampled HF dataset.",
-    )
-    # group for dataset specific arguments
-    sonnet_group = parser.add_argument_group("sonnet dataset options")
-    sonnet_group.add_argument(
-        "--sonnet-input-len",
-        type=int,
-        default=550,
-        help=
-        "Number of input tokens per request, used only for sonnet dataset.",
-    )
-    sonnet_group.add_argument(
-        "--sonnet-output-len",
-        type=int,
-        default=150,
-        help=
-        "Number of output tokens per request, used only for sonnet dataset.",
-    )
-    sonnet_group.add_argument(
-        "--sonnet-prefix-len",
-        type=int,
-        default=200,
-        help=
-        "Number of prefix tokens per request, used only for sonnet dataset.",
-    )
+class RandomDataset(BenchmarkDataset):
+    # Default values copied from benchmark_serving.py for the random dataset.
+    DEFAULT_PREFIX_LEN = 0
+    DEFAULT_RANGE_RATIO = 1.0
+    DEFAULT_INPUT_LEN = 1024
+    DEFAULT_OUTPUT_LEN = 128
 
-    sharegpt_group = parser.add_argument_group("sharegpt dataset options")
-    sharegpt_group.add_argument(
-        "--sharegpt-output-len",
-        type=int,
-        default=None,
-        help="Output length for each request. Overrides the output length "
-        "from the ShareGPT dataset.")
+    def __init__(
+        self,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
 
-    random_group = parser.add_argument_group("random dataset options")
-    random_group.add_argument(
-        "--random-input-len",
-        type=int,
-        default=1024,
-        help=
-        "Number of input tokens per request, used only for random sampling.",
-    )
-    random_group.add_argument(
-        "--random-output-len",
-        type=int,
-        default=128,
-        help=
-        "Number of output tokens per request, used only for random sampling.",
-    )
-    random_group.add_argument(
-        "--random-range-ratio",
-        type=float,
-        default=1.0,
-        help="Range of sampled ratio of input/output length, "
-        "used only for random sampling.",
-    )
-    random_group.add_argument(
-        "--random-prefix-len",
-        type=int,
-        default=0,
-        help="Number of fixed prefix tokens before random "
-        " context. The length range of context in a random "
-        " request is [random-prefix-len, "
-        " random-prefix-len + random-prefix-len * random-range-ratio).")
-    
-    random_group.add_argument(
-        "--input-lens",
-        type=int,
-        nargs='+',
-        default=[],  # Default list of possible input lengths
-        help="List of possible input lengths to use for generating random requests. "
-            "Specify multiple values to define varying input lengths."
-    )
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               prefix_len: int = DEFAULT_PREFIX_LEN,
+               range_ratio: float = DEFAULT_RANGE_RATIO,
+               input_len: int = DEFAULT_INPUT_LEN,
+               output_len: int = DEFAULT_OUTPUT_LEN,
+               **kwargs) -> list[SampleRequest]:
 
-    parser.add_argument(
-        '--tokenizer-mode',
-        type=str,
-        default="auto",
-        choices=['auto', 'slow', 'mistral', 'custom'],
-        help='The tokenizer mode.\n\n* "auto" will use the '
-        'fast tokenizer if available.\n* "slow" will '
-        'always use the slow tokenizer. \n* '
-        '"mistral" will always use the `mistral_common` tokenizer. \n*'
-        '"custom" will use --tokenizer to select the preregistered tokenizer.')
+        vocab_size = tokenizer.vocab_size
 
-    parser.add_argument("--served-model-name",
-                        type=str,
-                        default=None,
-                        help="The model name used in the API. "
-                        "If not specified, the model name will be the "
-                        "same as the ``--model`` argument. ")
+        prefix_token_ids = (np.random.randint(
+            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
 
-    parser.add_argument("--lora-modules",
-                        nargs='+',
-                        default=None,
-                        help="A subset of LoRA module names passed in when "
-                        "launching the server. For each request, the "
-                        "script chooses a LoRA module at random.")
+        input_low = int(input_len * range_ratio)
+        output_low = int(output_len * range_ratio)
 
-    args = parser.parse_args()
+        input_lens = np.random.randint(input_low,
+                                       input_len + 1,
+                                       size=num_requests)
+        output_lens = np.random.randint(output_low,
+                                        output_len + 1,
+                                        size=num_requests)
+        offsets = np.random.randint(0, vocab_size, size=num_requests)
 
-    main(args)
+        requests = []
+        for i in range(num_requests):
+            inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
+                         vocab_size).tolist()
+            token_sequence = prefix_token_ids + inner_seq
+            prompt = tokenizer.decode(token_sequence)
+            total_input_len = prefix_len + int(input_lens[i])
+            requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=total_input_len,
+                    expected_output_len=int(output_lens[i]),
+                ))
+        return requests
+
+
+# -----------------------------------------------------------------------------
+# ShareGPT Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class ShareGPTDataset(BenchmarkDataset):
+    """
+    Implements the ShareGPT dataset.  Loads data from a JSON file and generates
+    sample requests based on conversation turns.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+
+        with open(self.dataset_path, encoding="utf-8") as f:
+            self.data = json.load(f)
+        # Filter entries with at least two conversation turns.
+        self.data = [
+            entry for entry in self.data
+            if "conversations" in entry and len(entry["conversations"]) >= 2
+        ]
+        random.seed(self.random_seed)
+        random.shuffle(self.data)
+
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               lora_path: Optional[str] = None,
+               max_loras: Optional[int] = None,
+               output_len: Optional[int] = None,
+               **kwargs) -> list:
+        samples: list = []
+        for entry in self.data:
+            if len(samples) >= num_requests:
+                break
+            prompt, completion = entry["conversations"][0]["value"],\
+                entry["conversations"][1]["value"]
+
+            lora_request, tokenizer = self.get_random_lora_request(
+                tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
+            prompt_ids = tokenizer(prompt).input_ids
+            completion_ids = tokenizer(completion).input_ids
+            prompt_len = len(prompt_ids)
+            new_output_len = (len(completion_ids)
+                              if output_len is None else output_len)
+            if not is_valid_sequence(prompt_len,
+                                     new_output_len,
+                                     skip_min_output_len_check=output_len
+                                     is not None):
+                continue
+            samples.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=new_output_len,
+                    lora_request=lora_request,
+                ))
+        return samples
+
+
+# -----------------------------------------------------------------------------
+# Sonnet Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class SonnetDataset(BenchmarkDataset):
+    """
+    Simplified implementation of the Sonnet dataset.  Loads poem lines from a
+    text file and generates sample requests.  Default values here copied from
+    `benchmark_serving.py` for the sonnet dataset.
+    """
+
+    DEFAULT_PREFIX_LEN = 200
+    DEFAULT_INPUT_LEN = 550
+    DEFAULT_OUTPUT_LEN = 150
+
+    def __init__(
+        self,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self) -> None:
+        if not self.dataset_path:
+            raise ValueError("dataset_path must be provided.")
+        with open(self.dataset_path, encoding="utf-8") as f:
+            self.data = f.readlines()
+
+    def sample(self,
+               tokenizer,
+               num_requests: int,
+               prefix_len: int = DEFAULT_PREFIX_LEN,
+               input_len: int = DEFAULT_INPUT_LEN,
+               output_len: int = DEFAULT_OUTPUT_LEN,
+               return_prompt_formatted: bool = False,
+               **kwargs) -> list:
+        # Calculate average token length for a poem line.
+        tokenized_lines = [tokenizer(line).input_ids for line in self.data]
+        avg_len = sum(len(tokens)
+                      for tokens in \
+                        tokenized_lines) / len(tokenized_lines)
+
+        # Build the base prompt.
+        base_prompt = "Pick as many lines as you can from these poem lines:\n"
+        base_msg = [{"role": "user", "content": base_prompt}]
+        base_fmt = tokenizer.apply_chat_template(base_msg,
+                                                 add_generation_prompt=True,
+                                                 tokenize=False)
+        base_offset = len(tokenizer(base_fmt).input_ids)
+        if input_len <= base_offset:
+            raise ValueError(
+                f"'input_len' must be higher than the base prompt length "
+                f"({base_offset}).")
+
+        # Determine how many poem lines to use.
+        num_input_lines = round((input_len - base_offset) / avg_len)
+        num_prefix_lines = round((prefix_len - base_offset) / avg_len)
+        prefix_lines = self.data[:num_prefix_lines]
+
+        samples = []
+        for _ in range(num_requests):
+            extra_lines = random.choices(self.data,
+                                         k=num_input_lines - num_prefix_lines)
+            prompt = f"{base_prompt}{''.join(prefix_lines + extra_lines)}"
+            msg = [{"role": "user", "content": prompt}]
+            prompt_formatted = tokenizer.apply_chat_template(
+                msg, add_generation_prompt=True, tokenize=False)
+            prompt_len = len(tokenizer(prompt_formatted).input_ids)
+            samples.append(
+                SampleRequest(
+                    prompt=prompt_formatted
+                    if return_prompt_formatted else prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                ))
+        return samples
+
+
+# -----------------------------------------------------------------------------
+# BurstGPT Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class BurstGPTDataset(BenchmarkDataset):
+    """
+    Implements the BurstGPT dataset.  Loads data from a CSV file and generates
+    sample requests based on synthetic prompt generation. Only rows with Model
+    "GPT-4" and positive response tokens are used.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.load_data()
+
+    def load_data(self, ):
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+
+        df = pd.read_csv(self.dataset_path)
+        # Filter to keep only GPT-4 rows.
+        gpt4_df = df[df["Model"] == "GPT-4"]
+        # Remove failed requests (where Response tokens is 0 or less).
+        gpt4_df = gpt4_df[gpt4_df["Response tokens"] > 0]
+        # Sample the desired number of rows.
+        self.data = gpt4_df
+
+    def _sample_loaded_data(self, num_requests: int) -> list:
+        if num_requests <= len(self.data):
+            data = self.data.sample(n=num_requests,
+                                    random_state=self.random_seed)
+        else:
+            data = self.data.sample(
+                n=num_requests,
+                random_state=self.random_seed,
+                replace=True,
+            )
+        # Convert the dataframe to a list of lists.
+        return data.values.tolist()
+
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               max_loras: Optional[int] = None,
+               lora_path: Optional[str] = None,
+               **kwargs) -> list[SampleRequest]:
+        samples = []
+        data = self._sample_loaded_data(num_requests=num_requests)
+        for i in range(num_requests):
+            input_len = int(data[i][2])
+            output_len = int(data[i][3])
+            lora_req, tokenizer = self.get_random_lora_request(
+                tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
+            vocab_size = tokenizer.vocab_size
+            # Generate a synthetic prompt: a list of token IDs computed as (i +
+            # j) modulo vocab_size.
+            token_ids = [(i + j) % vocab_size for j in range(input_len)]
+            prompt = tokenizer.decode(token_ids)
+            samples.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=input_len,
+                    expected_output_len=output_len,
+                    lora_request=lora_req,
+                ))
+        return samples
+
+
+# -----------------------------------------------------------------------------
+# HuggingFace Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class HuggingFaceDataset(BenchmarkDataset):
+    """
+    Dataset class for processing a HuggingFace dataset with conversation data
+    and optional images.
+    """
+    DEFAULT_NUM_REQUESTS = 1000
+
+    def __init__(
+        self,
+        dataset_split: str,
+        dataset_subset: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.dataset_split = dataset_split
+        self.dataset_subset = dataset_subset
+
+        self.load_data()
+
+    def load_data(self) -> None:
+        if not self.dataset_path:
+            raise ValueError("dataset_path must be provided for loading data.")
+
+        self.data = load_dataset(
+            self.dataset_path,
+            name=self.dataset_subset,
+            split=self.dataset_split,
+            streaming=True,
+        )
+
+        if "conversations" not in self.data.features:
+            raise ValueError("HF Dataset must have a 'conversations' column.")
+
+        # Shuffle and filter examples with at least 2 conversations.
+        self.data = self.data.shuffle(seed=self.random_seed).filter(
+            lambda x: len(x["conversations"]) >= 2)
+
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               lora_path: Optional[str] = None,
+               max_loras: Optional[int] = None,
+               output_len: Optional[int] = None,
+               **kwargs) -> list:
+        sampled_requests = []
+        dynamic_output = output_len is None
+
+        for item in self.data:
+            if len(sampled_requests) >= num_requests:
+                break
+
+            conv = item["conversations"]
+            prompt, completion = conv[0]["value"], conv[1]["value"]
+
+            lora_request, tokenizer = self.get_random_lora_request(
+                tokenizer, lora_path=lora_path, max_loras=max_loras)
+
+            prompt_ids = tokenizer(prompt).input_ids
+            completion_ids = tokenizer(completion).input_ids
+            prompt_len = len(prompt_ids)
+            completion_len = len(completion_ids)
+            output_len = completion_len if dynamic_output else output_len
+            assert isinstance(output_len, int) and output_len > 0
+            if dynamic_output and not is_valid_sequence(
+                    prompt_len, completion_len):
+                continue
+
+            mm_content = process_image(
+                item["image"]) if "image" in item else None
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    multi_modal_data=mm_content,
+                    lora_request=lora_request,
+                ))
+        return sampled_requests
+
+
+# -----------------------------------------------------------------------------
+# Vision Arena Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class VisionArenaDataset(BenchmarkDataset):
+    """
+    Vision Arena Dataset.
+    """
+
+    DEFAULT_OUTPUT_LEN = 128
+    DEFAULT_NUM_REQUESTS = 1000
+    VISION_ARENA_DATASET_PATH = "lmarena-ai/vision-arena-bench-v0.1"
+
+    def __init__(
+        self,
+        dataset_split: str,
+        dataset_subset: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.dataset_split = dataset_split
+        self.dataset_subset = dataset_subset
+
+        if self.dataset_path != self.VISION_ARENA_DATASET_PATH:
+            raise ValueError(f"Only support Vision Arena dataset.\
+                    This data path {self.dataset_path} is not valid.")
+        if self.dataset_subset is None and self.dataset_split != "train":
+            raise ValueError("Dataset split must be 'train'.")
+
+        self.load_data()
+
+    def load_data(self) -> None:
+        dataset = load_dataset(
+            self.dataset_path,
+            name=self.dataset_subset,
+            split=self.dataset_split,
+            streaming=True,
+        )
+        self.data = dataset.shuffle(seed=self.random_seed)
+
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               output_len: int = DEFAULT_OUTPUT_LEN,
+               **kwargs) -> list:
+        # TODO (jenniferzhao): Add support for offline benchmark sampling
+        output_len = (output_len
+                      if output_len is not None else self.DEFAULT_OUTPUT_LEN)
+        sampled_requests = []
+        for item in self.data:
+            if len(sampled_requests) >= num_requests:
+                break
+            prompt = item["turns"][0][0]["content"]
+            prompt_len = len(tokenizer(prompt).input_ids)
+            mm_content = process_image(item["images"][0])
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    multi_modal_data=mm_content,
+                ))
+        return sampled_requests
