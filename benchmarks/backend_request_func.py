@@ -41,6 +41,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     server: str = "localhost"
+    done_time: float = 0.0
 
 
 async def async_request_tgi(

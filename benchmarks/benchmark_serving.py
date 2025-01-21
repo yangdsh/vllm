@@ -125,7 +125,7 @@ def sample_sharegpt_requests(
         # if prompt_len > 1024 or prompt_len + output_len > 2048:
             # Prune too long sequences.
             #continue
-        filtered_dataset.append((prompt, prompt_len, output_len, None))
+        filtered_dataset.append([prompt, prompt_len, output_len, None])
 
     return filtered_dataset
 
@@ -255,7 +255,7 @@ def sample_hf_requests(
         else:
             mm_content = None
 
-        sampled_requests.append((prompt, prompt_len, output_len, mm_content))
+        sampled_requests.append([prompt, prompt_len, output_len, mm_content])
 
     return sampled_requests
 
@@ -279,7 +279,9 @@ def sample_burstgpt_request(
         tokenizer (PreTrainedTokenizerBase): Tokenizer for generating prompts.
 
     Returns:
-        List[Tuple[str, int, int]]: List of prompts with their input/output lengths.
+        List[Tuple[str, int, int]], List[int]: 
+            List of prompts with their input/output lengths.
+            List of timestamps
     """
     if not args.time_scale:
         raise(ValueError, "csv requires args.time_scale")
@@ -315,12 +317,13 @@ def sample_burstgpt_request(
         prompt = tokenizer.decode(prefix_token_ids +
                                   [(offsets + i + j) % tokenizer.vocab_size
                                    for j in range(input_len_current)])
+        # print(len(prompt), input_len_current)
 
         cur_output_len = output_len
         if output_len == -1:
             cur_output_len = output_lens[i]
-        input_requests.append((prompt, int(prefix_len + input_len_current),
-                               int(cur_output_len), None))
+        input_requests.append([prompt, int(prefix_len + input_len_current),
+                               int(cur_output_len), None])
 
     return input_requests, input_timestamps
 
@@ -349,22 +352,16 @@ def sample_random_requests(
     input_requests = []
     for i in range(num_prompts):
         input_len_current = selected_input_lens[i]
-        input_length_variation = np.random.randint(
-            int(input_len_current * range_ratio),
-            input_len_current + 1,
-        )
         output_length_variation = np.random.randint(
             int(output_len * range_ratio),
             output_len + 1,
         )
-        offsets = np.random.randint(0, tokenizer.vocab_size)
 
-        prompt = tokenizer.decode(prefix_token_ids +
-                                  [(offsets + i + j) % tokenizer.vocab_size
-                                   for j in range(input_length_variation)])
+        prompt = ' '.join(['cat' for j in range(input_len_current)])
+        # print(len(tokenizer.encode(prompt)), input_len_current)
 
-        input_requests.append((prompt, int(prefix_len + input_length_variation),
-                               int(output_length_variation), None))
+        input_requests.append([prompt, int(prefix_len + input_len_current),
+                               int(output_length_variation), None])
 
     return input_requests
 
@@ -528,6 +525,9 @@ async def benchmark(
     gootput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
 ):
+    for i in range(len(input_requests)):
+        input_requests[i][1] = int(input_requests[i][1] * args.prompt_len_scale)
+    
     server_stats = {}
     api_url_short_prompts = f"http://{args.hosts[0]}:{args.ports[0]}{args.endpoint}"
     api_url_long_prompts = f"http://{args.hosts[1]}:{args.ports[1]}{args.endpoint}"
@@ -539,7 +539,7 @@ async def benchmark(
             server_stats[api_url_long_prompts] = ServerStat()
             return api_url_short_prompts if prompt_len < args.prompt_len_threshold else api_url_long_prompts
 
-        if args.prompt_len_threshold == -1:
+        if args.prompt_len_threshold <= 0:
             # return api_url_short_prompts if server_stats[api_url_short_prompts].count < server_stats[api_url_long_prompts].count else api_url_long_prompts
             return api_url_short_prompts if server_stats[api_url_short_prompts].prompt_len < server_stats[api_url_long_prompts].prompt_len else api_url_long_prompts
         else:
@@ -588,9 +588,10 @@ async def benchmark(
             result = await request_func(request_func_input=request_func_input,
                                       pbar=pbar)
             result.server = server
+            result.done_time = time.time()
             server_stats[server].count -= 1
             server_stats[server].prompt_len -= request_func_input.prompt_len
-            # print('done', server_stats[server].count, server_stats[server].prompt_len)
+            # print('done', server, server_stats[server].prompt_len)
             server_stats[server].ttft = (server_stats[server].ttft + result.ttft) * 0.5
             # print(server, server_stats[server].count, result.ttft, request_func_input.prompt_len)
             return result
@@ -652,7 +653,6 @@ async def benchmark(
     tasks: List[asyncio.Task] = []
     async for request, current_timestamp in get_request(input_requests, request_rate, input_timestamps):
         prompt, prompt_len, output_len, mm_content = request
-        prompt_len *= args.prompt_len_scale
         request_func_input = RequestFuncInput(model=model_id,
                                               prompt=prompt,
                                               api_url=api_url_short_prompts, # update later,
@@ -735,12 +735,17 @@ async def benchmark(
         "ttfts": [output.ttft for output in outputs],
         "ttfts_host1": [output.ttft for output in outputs if args.hosts[0] in output.server],
         "ttfts_host2": [output.ttft for output in outputs if args.hosts[0] not in output.server],
+        "done_time": [output.done_time for output in outputs],
+        "done_time_host1": [output.done_time for output in outputs if args.hosts[0] in output.server],
+        "done_time_host2": [output.done_time for output in outputs if args.hosts[0] not in output.server],
         "itls": [output.itl for output in outputs],
         "itls_host1": [output.itl for output in outputs if args.hosts[0] in output.server],
         "itls_host2": [output.itl for output in outputs if args.hosts[0] not in output.server],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    print(server_stats[api_url_short_prompts].running_prompt_lens)
+    print(server_stats[api_url_long_prompts].running_prompt_lens)
 
     def process_one_metric(
         # E.g., "ttft"
@@ -1259,7 +1264,7 @@ if __name__ == "__main__":
         "--input-ratios",
         type=float,
         nargs='+',
-        default=[0.5, 0.5],  # Default ratios corresponding to input lengths
+        default=[0.94, 0.06],  # Default ratios corresponding to input lengths
         help="List of ratios for selecting input lengths. "
             "The length of this list should match the length of --input-len, "
             "and the ratios must sum to 1.0."
@@ -1280,7 +1285,7 @@ if __name__ == "__main__":
     random_group.add_argument(
         "--prompt-len-scale",
         type=float,
-        default=None,
+        default=1,
         help="speed up requests by time_scale.")
     
     random_group.add_argument(
@@ -1295,5 +1300,4 @@ if __name__ == "__main__":
     if len(args.hosts) == 1:
         args.hosts = [args.hosts[0], args.hosts[0]]
         args.ports = [args.ports[0], args.ports[0]]
-    args.prompt_len_threshold *= args.prompt_len_scale
     main(args)
