@@ -1,9 +1,8 @@
-from typing import List
+# SPDX-License-Identifier: Apache-2.0
 
 import pytest
 import torch
 
-from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.engine.arg_utils import EngineArgs
@@ -23,6 +22,15 @@ def _create_model_runner(model: str, *args, **kwargs) -> ModelRunner:
     return model_runner
 
 
+def test_deepseek_mla_attn_backend_module():
+    model_runner = _create_model_runner(
+        "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+        trust_remote_code=True,
+        enable_chunked_prefill=False,
+    )
+    assert model_runner.attn_backend.__name__ == "TritonMLABackend"
+
+
 @pytest.mark.parametrize("batch_size", list(range(1, 257)))
 def test_prepare_prompt(batch_size):
     model_runner = _create_model_runner(
@@ -32,8 +40,8 @@ def test_prepare_prompt(batch_size):
         enable_chunked_prefill=False,
     )
 
-    seq_lens: List[int] = []
-    seq_group_metadata_list: List[SequenceGroupMetadata] = []
+    seq_lens: list[int] = []
+    seq_group_metadata_list: list[SequenceGroupMetadata] = []
     block_tables = {0: [1]}
     for i in range(batch_size):
         # make sure all tokens fit into one block
@@ -149,8 +157,8 @@ def test_prepare_decode_cuda_graph(batch_size):
         enable_chunked_prefill=False,
     )
 
-    context_lens: List[int] = []
-    seq_group_metadata_list: List[SequenceGroupMetadata] = []
+    context_lens: list[int] = []
+    seq_group_metadata_list: list[SequenceGroupMetadata] = []
     # Assume each seq group finishes prefill.
     for i in range(batch_size):
         # make sure all tokens fit into one block
@@ -177,7 +185,8 @@ def test_prepare_decode_cuda_graph(batch_size):
         model_input.attn_metadata, model_input.attn_metadata.slot_mapping)
     assert len(slot_mapping) == len(input_tokens)
 
-    expected_bs = VllmConfig.get_graph_batch_size(len(seq_group_metadata_list))
+    expected_bs = model_runner.vllm_config.pad_for_cudagraph(
+        len(seq_group_metadata_list))
     # Verify input metadata is correct for prompts.
     device = model_runner.device
     assert attn_metadata.num_prefills == 0
@@ -254,7 +263,7 @@ def test_empty_seq_group():
         dtype="float16",
         enforce_eager=False,
     )
-    seq_group_metadata_list: List[SequenceGroupMetadata] = []
+    seq_group_metadata_list: list[SequenceGroupMetadata] = []
     model_input = model_runner._prepare_model_input_tensors(
         seq_group_metadata_list)
     input_tokens, input_positions, attn_metadata = (
@@ -304,10 +313,10 @@ def test_hybrid_batches(batch_size, enforce_eager, distributed_init):
     )
 
     # Add prefill requests.
-    seq_lens: List[int] = []
-    seq_group_metadata_list: List[SequenceGroupMetadata] = []
-    prefill_metadata_list: List[SequenceGroupMetadata] = []
-    decode_metadata_list: List[SequenceGroupMetadata] = []
+    seq_lens: list[int] = []
+    seq_group_metadata_list: list[SequenceGroupMetadata] = []
+    prefill_metadata_list: list[SequenceGroupMetadata] = []
+    decode_metadata_list: list[SequenceGroupMetadata] = []
     block_tables = {0: [1]}
     prefill_batch_size = batch_size // 2
     decode_batch_size = batch_size - prefill_batch_size

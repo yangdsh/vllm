@@ -1,7 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib.util
 import math
 from array import array
-from typing import List
 
 import openai
 import pytest
@@ -35,7 +36,7 @@ def test_find_array(monkeypatch):
     from vllm.model_executor.models.gritlm import GritLMPooler
 
     # Create an LLM object to get the model config.
-    llm = vllm.LLM(MODEL_NAME, task="embedding", max_model_len=MAX_MODEL_LEN)
+    llm = vllm.LLM(MODEL_NAME, task="embed", max_model_len=MAX_MODEL_LEN)
     pooler = GritLMPooler(model_config=llm.llm_engine.model_config)
 
     arr = _arr([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
@@ -55,7 +56,7 @@ def server_embedding():
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_ATTENTION_BACKEND", "XFORMERS")
 
-        args = ["--task", "embedding", "--max_model_len", str(MAX_MODEL_LEN)]
+        args = ["--task", "embed", "--max_model_len", str(MAX_MODEL_LEN)]
         with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
             yield remote_server
 
@@ -79,14 +80,14 @@ async def client_generate(server_generate: RemoteOpenAIServer):
         yield async_client
 
 
-def run_llm_encode(llm: vllm.LLM, queries: List[str],
-                   instruction: str) -> List[float]:
+def run_llm_encode(llm: vllm.LLM, queries: list[str],
+                   instruction: str) -> list[float]:
     outputs = llm.encode([instruction + q for q in queries], )
     return [output.outputs.embedding for output in outputs]
 
 
-async def run_client_embeddings(client: vllm.LLM, queries: List[str],
-                                instruction: str) -> List[float]:
+async def run_client_embeddings(client: vllm.LLM, queries: list[str],
+                                instruction: str) -> list[float]:
     outputs = await client.embeddings.create(
         model=MODEL_NAME,
         input=[instruction + q for q in queries],
@@ -121,7 +122,7 @@ def get_test_data():
     return queries, q_instruction, documents, d_instruction
 
 
-def validate_embed_output(q_rep: List[float], d_rep: List[float]):
+def validate_embed_output(q_rep: list[float], d_rep: list[float]):
     cosine_sim_q0_d0 = 1 - cosine(q_rep[0], d_rep[0])
     assert math.isclose(cosine_sim_q0_d0, 0.609, abs_tol=0.001)
 
@@ -141,7 +142,7 @@ def test_gritlm_offline_embedding(monkeypatch):
 
     queries, q_instruction, documents, d_instruction = get_test_data()
 
-    llm = vllm.LLM(MODEL_NAME, task="embedding", max_model_len=MAX_MODEL_LEN)
+    llm = vllm.LLM(MODEL_NAME, task="embed", max_model_len=MAX_MODEL_LEN)
 
     d_rep = run_llm_encode(
         llm,

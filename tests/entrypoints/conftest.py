@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 
 
@@ -97,6 +99,86 @@ def sample_complex_json_schema():
             }
         },
         "required": ["score", "grade", "email", "tags"]
+    }
+
+
+@pytest.fixture
+def sample_definition_json_schema():
+    return {
+        '$defs': {
+            'Step': {
+                'properties': {
+                    'explanation': {
+                        'title': 'Explanation',
+                        'type': 'string'
+                    },
+                    'output': {
+                        'title': 'Output',
+                        'type': 'string'
+                    }
+                },
+                'required': ['explanation', 'output'],
+                'title': 'Step',
+                'type': 'object'
+            }
+        },
+        'properties': {
+            'steps': {
+                'items': {
+                    '$ref': '#/$defs/Step'
+                },
+                'title': 'Steps',
+                'type': 'array'
+            },
+            'final_answer': {
+                'title': 'Final Answer',
+                'type': 'string'
+            }
+        },
+        'required': ['steps', 'final_answer'],
+        'title': 'MathReasoning',
+        'type': 'object'
+    }
+
+
+@pytest.fixture
+def sample_enum_json_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["active", "inactive",
+                         "pending"]  # Literal values using enum
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "critical"]
+            },
+            "category": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["bug", "feature", "improvement"]
+                    },
+                    "severity": {
+                        "type": "integer",
+                        "enum": [1, 2, 3, 4,
+                                 5]  # Enum can also contain numbers
+                    }
+                },
+                "required": ["type", "severity"]
+            },
+            "flags": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["urgent", "blocked", "needs_review", "approved"]
+                }
+            }
+        },
+        "required": ["status", "priority", "category", "flags"]
     }
 
 
