@@ -31,6 +31,7 @@ class RequestFuncInput:
     extra_body: Optional[dict] = None
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
+    timestamp: float = 0
 
 
 @dataclass

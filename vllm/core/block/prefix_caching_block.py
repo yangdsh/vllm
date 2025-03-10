@@ -181,6 +181,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert block.content_hash is not None
 
         cached_block_id = self._cached_blocks.get(block.content_hash, None)
+        # print(token_ids, cached_block_id, prev_block.block_id if prev_block is not None else -1)
         if cached_block_id is not None:
             self.metric_data.query(hit=True)
             block.block_id = cached_block_id
@@ -450,6 +451,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        # Reset the metrics.
+        self.metric_data = CacheMetricData()
+        # return True
         num_used_blocks = (self.get_num_total_blocks() -
                            self.get_num_free_blocks())
         if num_used_blocks > 0:
@@ -472,9 +476,6 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # Reset the block tracker.
         for block_id in self._block_tracker:
             self._block_tracker[block_id] = BlockTracker()
-
-        # Reset the metrics.
-        self.metric_data = CacheMetricData()
 
         logger.info("Successfully reset prefix cache")
         return True
