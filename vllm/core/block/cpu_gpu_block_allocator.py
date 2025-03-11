@@ -28,6 +28,8 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         num_gpu_blocks: int,
         num_cpu_blocks: int,
         block_size: int,
+        eviction_algorithm: str = 'lru',
+        eviction_algorithm_config: str = ''
     ) -> DeviceAwareBlockAllocator:
         """Creates a CpuGpuBlockAllocator instance with the specified
         configuration.
@@ -82,12 +84,16 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
                 num_blocks=num_gpu_blocks,
                 block_size=block_size,
                 block_ids=gpu_block_ids,
+                eviction_algorithm=eviction_algorithm,
+                eviction_algorithm_config=eviction_algorithm_config
             )
 
             cpu_allocator = PrefixCachingBlockAllocator(
                 num_blocks=num_cpu_blocks,
                 block_size=block_size,
                 block_ids=cpu_block_ids,
+                eviction_algorithm=eviction_algorithm,
+                eviction_algorithm_config=eviction_algorithm_config
             )
         else:
             raise ValueError(f"Unknown allocator type {allocator_type=}")
@@ -313,11 +319,12 @@ class CpuGpuBlockAllocator(DeviceAwareBlockAllocator):
         return self._allocators[device].clear_copy_on_writes()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float, extra_feature: dict) -> None:
         """Mark blocks as accessed, only use for prefix caching."""
         # Prefix caching only supported on GPU.
         device = Device.GPU
-        return self._allocators[device].mark_blocks_as_accessed(block_ids, now)
+        return self._allocators[device].mark_blocks_as_accessed(
+            block_ids, now, extra_feature)
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
         """Mark blocks as accessed, only use for prefix caching."""

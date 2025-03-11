@@ -637,7 +637,6 @@ async def benchmark(
     input_requests: list[tuple[str, int, int]],
     input_timestamps: Optional[list[float]],
     logprobs: Optional[int],
-    best_of: int,
     request_rate: float,
     disable_tqdm: bool,
     profile: bool,
@@ -862,7 +861,6 @@ async def benchmark(
                 prompt_len=input_requests[0][1],
                 output_len=input_requests[0][2],
                 logprobs=logprobs,
-                best_of=best_of,
                 multi_modal_content=None,
                 ignore_eos=ignore_eos,
                 timestamp=time.time()
@@ -896,7 +894,6 @@ async def benchmark(
             prompt_len=prompt_len,
             output_len=output_len,
             logprobs=logprobs,
-            best_of=best_of,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
             timestamp=time.time()
@@ -932,7 +929,6 @@ async def benchmark(
                 prompt_len=input_requests[0][1],
                 output_len=input_requests[0][2],
                 logprobs=logprobs,
-                best_of=best_of,
                 timestamp=time.time()
             )
             profile_output = await request_func(request_func_input=profile_input, pbar=pbar)
@@ -1209,7 +1205,6 @@ def main(args: argparse.Namespace):
             input_requests=input_requests,
             input_timestamps=input_timestamps,
             logprobs=args.logprobs,
-            best_of=args.best_of,
             request_rate=args.request_rate,
             disable_tqdm=args.disable_tqdm,
             profile=args.profile,
@@ -1235,7 +1230,6 @@ def main(args: argparse.Namespace):
         result_json["backend"] = backend
         result_json["model_id"] = model_id
         result_json["tokenizer_id"] = tokenizer_id
-        result_json["best_of"] = args.best_of
         result_json["num_prompts"] = args.num_prompts
 
         # Metadata
@@ -1349,13 +1343,6 @@ if __name__ == "__main__":
         type=str,
         help=
         "Name or path of the tokenizer, if not using the default tokenizer.",  # noqa: E501
-    )
-    parser.add_argument(
-        "--best-of",
-        type=int,
-        default=1,
-        help="Generates `best_of` sequences per prompt and "
-        "returns the best one.",
     )
     parser.add_argument("--use-beam-search", action="store_true")
     parser.add_argument(

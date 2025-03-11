@@ -352,6 +352,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "The priority of the request (lower means earlier handling; "
             "default: 0). Any priority other than 0 will raise an error "
             "if the served model does not use priority scheduling."))
+    cache_hint: str = Field(
+        default=None,
+        description=(
+            "The hint to when to evict the sequence's blocks from prefix cache"))
     request_id: str = Field(
         default_factory=lambda: f"{random_uuid()}",
         description=(

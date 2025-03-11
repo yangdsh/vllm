@@ -33,6 +33,7 @@ class BlockTracker:
 
     def reset(self):
         self.last_accessed: float = _DEFAULT_LAST_ACCESSED_TIME
+        self.extra_feature: dict = {}
         self.computed: bool = False
 
     def __init__(self):
@@ -80,6 +81,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         block_size: int,
         block_ids: Optional[Iterable[int]] = None,
         eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
+        eviction_algorithm: str = 'lru',
+        eviction_algorithm_config: str = ''
     ):
         if block_ids is None:
             block_ids = range(num_blocks)
@@ -119,7 +122,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # Evitor used to maintain how we want to handle those computed blocks
         # if we find memory pressure is high.
         self.eviction_policy = eviction_policy
-        self.evictor: Evictor = make_evictor(self.eviction_policy)
+        self.eviction_algorithm = eviction_algorithm
+        self.eviction_algorithm_config = eviction_algorithm_config
+        self.evictor: Evictor = make_evictor(eviction_algorithm, eviction_algorithm_config)
 
         # We share the refcounter between allocators. This allows us to promote
         # blocks originally allocated in the hashless allocator to immutable
@@ -273,7 +278,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # Add the cached block to the evictor
         # (This keeps the cached block around so it can be reused)
         self.evictor.add(block_id, block.content_hash, block.num_tokens_total,
-                         self._block_tracker[block_id].last_accessed)
+                         self._block_tracker[block_id].last_accessed,
+                         self._block_tracker[block_id].extra_feature)
 
         # Stop tracking the block
         self._untrack_block_id(block_id)
@@ -471,7 +477,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert not self._cached_blocks
 
         # Reset the evictor.
-        self.evictor = make_evictor(self.eviction_policy)
+        self.evictor = make_evictor(self.eviction_algorithm, self.eviction_algorithm_config)
 
         # Reset the block tracker.
         for block_id in self._block_tracker:
@@ -562,7 +568,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         return self._cow_tracker.clear_cows()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float, extra_feature: dict) -> None:
         """Mark blocks as accessed, used in prefix caching.
 
         If the block is added into evictor, we need to update corresponding
@@ -572,6 +578,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         for block_id in block_ids:
             if self._block_tracker[block_id].active:
                 self._block_tracker[block_id].last_accessed = now
+                self._block_tracker[block_id].extra_feature = extra_feature
             elif block_id in self.evictor:
                 self.evictor.update(block_id, now)
             else:

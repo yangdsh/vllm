@@ -256,7 +256,7 @@ class NaiveBlockAllocator(BlockAllocator):
         return self._cow_tracker.clear_cows()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float, extra_feature: dict) -> None:
         """Mark blocks as accessed, used in prefix caching.
 
         Since the naive allocator does not implement prefix caching, we do

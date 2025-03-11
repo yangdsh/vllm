@@ -163,7 +163,7 @@ class BlockAllocator(ABC):
 
     @abstractmethod
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float, extra_feature: dict) -> None:
         pass
 
     @abstractmethod
@@ -264,7 +264,7 @@ class DeviceAwareBlockAllocator(ABC):
 
     @abstractmethod
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float) -> None:
+                                now: float, extra_feature: dict) -> None:
         pass
 
     @abstractmethod

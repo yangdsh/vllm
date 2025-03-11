@@ -118,6 +118,8 @@ class EngineArgs:
     max_parallel_loading_workers: Optional[int] = None
     block_size: Optional[int] = None
     enable_prefix_caching: Optional[bool] = None
+    eviction_algorithm: Optional[str] = 'lru'
+    eviction_algorithm_config: Optional[str] = ''
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
@@ -477,6 +479,18 @@ class EngineArgs:
             default=EngineArgs.enable_prefix_caching,
             help="Enables automatic prefix caching. "
             "Use ``--no-enable-prefix-caching`` to disable explicitly.",
+        )
+        parser.add_argument(
+            "--eviction-algorithm",
+            type=str,
+            default='lru',
+            help="Eviction algorithm for prefix caching. "
+        )
+        parser.add_argument(
+            "--eviction-algorithm-config",
+            type=str,
+            default='',
+            help="Eviction algorithm config in the format a=b,c=d,... "
         )
         parser.add_argument('--disable-sliding-window',
                             action='store_true',
@@ -1219,6 +1233,8 @@ class EngineArgs:
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
+            eviction_algorithm=self.eviction_algorithm,
+            eviction_algorithm_config=self.eviction_algorithm_config,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,
         )

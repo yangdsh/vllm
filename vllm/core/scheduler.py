@@ -462,6 +462,8 @@ class Scheduler:
             num_cpu_blocks=num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching,
+            eviction_algorithm=self.cache_config.eviction_algorithm,
+            eviction_algorithm_config=self.cache_config.eviction_algorithm_config
         )
 
         # Sequence groups in the WAITING state.
