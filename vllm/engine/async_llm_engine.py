@@ -452,6 +452,7 @@ class _AsyncLLMEngine(LLMEngine):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        cache_hint: dict = None,
     ) -> None:
         ...
 
@@ -469,6 +470,7 @@ class _AsyncLLMEngine(LLMEngine):
             trace_headers: Optional[Mapping[str, str]] = None,
             prompt_adapter_request: Optional[PromptAdapterRequest] = None,
             priority: int = 0,
+            cache_hint: dict = None,
             *,
             inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> None:
@@ -521,6 +523,7 @@ class _AsyncLLMEngine(LLMEngine):
             prompt_adapter_request=prompt_adapter_request,
             trace_headers=trace_headers,
             priority=priority,
+            cache_hint=cache_hint,
         )
 
     async def check_health_async(self) -> None:
@@ -862,6 +865,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        cache_hint: dict = None,
     ) -> Coroutine[None, None, AsyncGenerator[Union[
             RequestOutput, PoolingRequestOutput], None]]:
         ...
@@ -877,6 +881,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        cache_hint: dict = None,
     ) -> Coroutine[None, None, AsyncGenerator[Union[
             RequestOutput, PoolingRequestOutput], None]]:
         ...
@@ -895,6 +900,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        cache_hint: dict = None,
         *,
         inputs: Optional[PromptType] = None,  # DEPRECATED
     ) -> AsyncGenerator[Union[RequestOutput, PoolingRequestOutput], None]:
@@ -927,6 +933,7 @@ class AsyncLLMEngine(EngineClient):
             trace_headers=trace_headers,
             prompt_adapter_request=prompt_adapter_request,
             priority=priority,
+            cache_hint=cache_hint,
         )
 
         return stream.generator()
@@ -940,6 +947,7 @@ class AsyncLLMEngine(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        cache_hint: dict = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """Generate outputs for a request.
 
@@ -958,6 +966,7 @@ class AsyncLLMEngine(EngineClient):
                                             for generation, if any.
             priority: The priority of the request.
                 Only applicable with priority scheduling.
+            cache_hint: The hint for prefix cache
 
         Yields:
             The output `RequestOutput` objects from the LLMEngine
@@ -1016,6 +1025,7 @@ class AsyncLLMEngine(EngineClient):
                     trace_headers=trace_headers,
                     prompt_adapter_request=prompt_adapter_request,
                     priority=priority,
+                    cache_hint=cache_hint,
             ):
                 yield LLMEngine.validate_output(output, RequestOutput)
         except asyncio.CancelledError:
@@ -1205,5 +1215,5 @@ class AsyncLLMEngine(EngineClient):
 # TODO(v1): Remove this class proxy when V1 goes default.
 if envs.VLLM_USE_V1:
     from vllm.v1.engine.async_llm import AsyncLLM
-
+    print("running vLLM V1")
     AsyncLLMEngine = AsyncLLM  # type: ignore

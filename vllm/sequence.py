@@ -399,6 +399,7 @@ class Sequence:
         eos_token_id: The end-of-sequence (EOS) token id recognized by this LLM.
         lora_request: LoRA request.
         prompt_adapter_request: Prompt Adapter request.
+        cache_hint: User-defined hint of the request for prefix cache eviction.
     """
 
     def __init__(
@@ -641,6 +642,7 @@ class SequenceGroup:
         trace_headers: OpenTelemetry trace headers.
         prompt_adapter_request: Prompt Adapter request.
         priority: User-defined priority of the request.
+        cache_hint: User-defined hint of the request for prefix cache eviction.
     """
 
     def __init__(
@@ -656,6 +658,7 @@ class SequenceGroup:
         trace_headers: Optional[Mapping[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         priority: int = 0,
+        cache_hint: dict = None,
     ) -> None:
         self.request_id = request_id
         self.seqs = seqs
@@ -680,6 +683,7 @@ class SequenceGroup:
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.priority = priority
+        self.cache_hint = cache_hint
 
         self.cached_request_output = None
 
@@ -1445,6 +1449,7 @@ class ParallelSampleSequenceGroup(SequenceGroupBase):
             trace_headers=seq_group.trace_headers,
             prompt_adapter_request=seq_group.prompt_adapter_request,
             priority=seq_group.priority,
+            cache_hint=seq_group.cache_hint,
         )
 
         group.streaming = params.output_kind == RequestOutputKind.DELTA

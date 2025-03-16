@@ -26,12 +26,14 @@ On the client side, run:
 import argparse
 import asyncio
 import base64
+import csv
 import gc
 import io
 import json
 import os
 import csv
 import math
+import numpy
 import random
 import requests
 import time
@@ -40,10 +42,13 @@ from asyncio import Lock
 from collections.abc import AsyncGenerator, Collection
 from dataclasses import dataclass
 from datetime import datetime
+from collections import OrderedDict
+from sortedcontainers import SortedDict
 from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
+import lightgbm as lgb
 from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
                                   RequestFuncOutput)
 from datasets import load_dataset
@@ -183,7 +188,6 @@ def sample_burstgpt_requests(
                 i = i + 1
                 if i >= num_requests:
                     break
-        print('request counts: ', len(input_lens))
 
     # Generate prefix tokens
     prefix_token_ids = np.random.randint(0, tokenizer.vocab_size, size=prefix_len).tolist()
@@ -191,11 +195,9 @@ def sample_burstgpt_requests(
     input_requests = []
     for i in range(len(input_lens)):
         input_len_current = input_lens[i]
-        # input_len_current = 2048
-        offsets = i # np.random.randint(0, tokenizer.vocab_size)
 
         prompt = tokenizer.decode(prefix_token_ids +\
-         [offsets % tokenizer.vocab_size for j in range(input_len_current)])
+         [np.random.randint(0, tokenizer.vocab_size) % tokenizer.vocab_size for j in range(input_len_current)])
 
         cur_output_len = output_len
         if output_len == -1:
@@ -612,19 +614,67 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+class RequestStats:
+    def __init__(self):
+        self.training_data = OrderedDict()
+        training_dir = os.path.join(args.result_dir, "training_data")
+        os.makedirs(training_dir, exist_ok=True)
+        self.training_file = os.path.join(training_dir, f'{int(time.time())}.csv')
+        with open(self.training_file, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['tp', 'pp', 'in_flight_tokens', 'progress', 'queue_tokens',
+                            'in_flight_prompt_cnt', 'prompt_len', 'ttft'])
+    
+    def add(self, id, pp, tp, in_flight_tokens, queue_tokens,
+            in_flight_prompt_lens, prompt_dispatch_timestamps):
+        progress = 0
+        for l, t in zip(in_flight_prompt_lens, prompt_dispatch_timestamps):
+            progress += (time.time() - t) * l
+        if in_flight_tokens > 0:
+            progress /= in_flight_tokens
+        self.training_data[id] = [
+            tp, pp, in_flight_tokens, progress, 
+            queue_tokens, len(in_flight_prompt_lens)
+        ]
+
+    def label(self, sid, request_func_input, ttft, log_file):
+        """Save training data for later model training."""
+        self.training_data[request_func_input.id].extend([request_func_input.prompt_len, ttft])
+        print(f"Server {sid} prompt_len={request_func_input.prompt_len} "
+              f"ttft={ttft} ttft_={request_func_input.predicted_latency}", file=log_file)
+        if request_func_input.id % 128 == 0:
+            self.dump()
+    
+    def dump(self):
+        # Save training_data to CSV.
+        if 'test' not in args.dataset_path:
+            with open(self.training_file, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                id_to_pop = []
+                for id, row in self.training_data.items():
+                    if len(row) >= 8: # already labelled
+                        writer.writerow(row)
+                        id_to_pop.append(id)
+                for id in id_to_pop:
+                    self.training_data.pop(id)
+            # print(f"Training data saved to {self.training_file}")
+
 class ServerStat:
-    def __init__(self, url, max_concurrency, weight, prompt_len_range=(0, 1e9)):
+    def __init__(self, i, url, max_concurrency, overhead, tp, pp):
+        self.id = i
         self.url = url
         self.max_concurrency = max_concurrency
-        self.weight = weight
-        self.prefill_tokens = 0    # Tokens currently in process
-        self.count = 0             # Number of in-progress requests
-        self.prompt_lens = []      # List of prompt lengths processed
-        self.in_flight_prompt_lens = []      # List of prompt lengths processed
-        self.accumulated_lens = [] # History of accumulated token counts
-        self.queue_latencys = []   # Latency values for tasks waiting in queue
-        self.prompt_len_range = prompt_len_range  # (min, max) prompt length for this server
-
+        self.overhead = overhead
+        self.tp = tp            # Fixed: assign tp here.
+        self.pp = pp
+        self.in_flight_tokens = 0    # Tokens currently in process.
+        self.count = 0               # Number of in-progress requests.
+        self.ttft = 0
+        self.prompt_lens = []        # List of prompt lengths processed.
+        self.in_flight_prompt_lens = []
+        self.prompt_dispatch_timestamps = []
+        self.accumulated_lens = []   # History of accumulated token counts.
+        self.queue_latencys = []     # Latency values for tasks waiting in queue.
 
 # --------------------------
 # Main benchmark function
@@ -633,164 +683,214 @@ async def benchmark(
     backend: str,
     model_id: str,
     model_name: str,
-    tokenizer: PreTrainedTokenizerBase,
-    input_requests: list[tuple[str, int, int]],
-    input_timestamps: Optional[list[float]],
-    logprobs: Optional[int],
+    tokenizer,  # assumed PreTrainedTokenizerBase or similar.
+    input_requests: list,
+    input_timestamps,  # Optional list of floats.
+    logprobs: int,
     request_rate: float,
     disable_tqdm: bool,
     profile: bool,
-    selected_percentile_metrics: list[str],
-    selected_percentiles: list[str],
+    selected_percentile_metrics: list,
+    selected_percentiles: list,
     ignore_eos: bool,
-    goodput_config_dict: dict[str, float],
-    max_concurrencys: list[int],
-    weights: list[float],
-    prompt_len_ranges: list[int],
-    lora_modules: Optional[list[str]],
+    goodput_config_dict: dict,
+    max_concurrencys: list,
+    overheads: list,
+    tp_degrees: list,
+    pp_degrees: list,
+    lora_modules: list = None,
 ):
-    # Initialize progress bar
+    # Open log file.
+    if args.result_dir:
+        file_name = os.path.join(args.result_dir, args.result_filename)
+        log_name = file_name + '.log'
+        log_file = open(log_name, 'w')
+        # Initialize an empty dictionary for the models.
+        models = {}
+        if args.len_based_dispatching >= 2:
+            for tp in [1, 2, 4]:
+                for pp in [1, 2, 4]:
+                    model_file = f"{args.result_dir}/training_data/lgb_model_tp{tp}_pp{pp}.txt"
+                    if os.path.exists(model_file):
+                        models[(tp, pp)] = lgb.Booster(model_file=model_file)
+                        print(f"Loaded model for tp={tp}, pp={pp} from {model_file}")
+    else:
+        log_file = open("benchmark.log", 'w')
+
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
     server_ids = range(len(args.hosts))
-    # Use asyncio.PriorityQueue to order requests by timestamp (lowest first)
-    request_queues = {i: asyncio.PriorityQueue() for i in server_ids}
     server_stats_condition = asyncio.Condition()
     server_stats = []
 
-    # --------------------------
-    # Helper functions
-    # --------------------------
+    request_queues = [SortedDict() for _ in range(len(args.hosts))]
+    req_stats = RequestStats()
+
+    def estimate_request_latency(stats, queue_tokens, prompt_len):
+        """
+        Estimate the latency for a request using a LightGBM model.
+        """
+        current_time = time.time()
+        progress = 0.0
+        for l, t in zip(stats.in_flight_prompt_lens, stats.prompt_dispatch_timestamps):
+            progress += (current_time - t) * l
+        if stats.in_flight_tokens > 0:
+            progress /= stats.in_flight_tokens
+        else:
+            progress = 0.0
+
+        in_flight_prompt_cnt = len(stats.in_flight_prompt_lens)
+        
+        # Construct the feature vector as a 2D numpy array.
+        feature_array = np.array([[stats.in_flight_tokens, progress, queue_tokens,
+                                    in_flight_prompt_cnt, prompt_len]])
+        
+        # Use a dictionary to select the appropriate model based on stats.pp.
+        model = models.get((stats.tp, stats.pp))
+        if model is None:
+            raise ValueError("cannot find lightgbm model", stats.tp, stats.pp)
+        
+        # Predict and return the latency.
+        predicted_latency = model.predict(feature_array)[0]
+        return predicted_latency
+
+    def estimate_server_max_latency(stats, queue: SortedDict):
+        max_latency = float('-inf')
+        queue_tokens = 0
+        for req, _ in queue.values():
+            req_latency = estimate_request_latency(stats, queue_tokens, req.prompt_len)
+            req_latency += time.time() - req.timestamp
+            queue_tokens += req.prompt_len
+            if req_latency > max_latency:
+                max_latency = req_latency
+        return max_latency
 
     def get_base_url(server_id):
         return f"http://{args.hosts[server_id]}:{args.ports[server_id]}"
-
-    def get_api_url(prompt_len: int) -> int:
+    
+    def get_api_url(request_func_input) -> int:
+        prompt_len = request_func_input.prompt_len
         best_server = None
-        if not args.len_based_dispatching:
+        if args.len_based_dispatching <= 0:
             best_load = float('inf')
             for i in range(len(args.hosts)):
-                # Sum up prompt_len in the queue for server i
-                queue_load = sum(item[1][0].prompt_len for item in request_queues[i]._queue)
-                load = server_stats[i].prefill_tokens + queue_load
+                queue_load = sum(req.prompt_len for req, _ in request_queues[i].values())
+                load = server_stats[i].in_flight_tokens + queue_load
                 if load < best_load:
                     best_load = load
+                    request_func_input.predicted_latency = load
                     best_server = i
         else:
             best_load = float('inf')
             for i in range(len(args.hosts)):
-                queue_load = sum(item[1][0].prompt_len for item in request_queues[i]._queue)
-                load = (server_stats[i].prefill_tokens * server_stats[i].weight + queue_load)
-                if prompt_len > server_stats[i].prompt_len_range[1]:
-                    load *= prompt_len / server_stats[i].prompt_len_range[1]
+                queue_load = sum(req.prompt_len for req, _ in request_queues[i].values())
+                load = server_stats[i].in_flight_tokens / server_stats[i].pp + queue_load
+                load = (load + prompt_len * server_stats[i].pp) * server_stats[i].overhead
+                if args.len_based_dispatching >= 2:
+                    load = estimate_request_latency(server_stats[i], queue_load, prompt_len)
                 if load < best_load:
                     best_load = load
+                    request_func_input.predicted_latency = load
                     best_server = i
         return best_server
 
-    async def rebalance_queues(server_id: int):
+    def rebalance_queues():
         """
-        For the server with id 'server_id', if its weighted load is above average,
-        this function will move requests from its priority queue to a target server.
-        The target server is chosen based on the request's prompt_len falling into
-        its prompt_len_range. Finally, it returns the next request from the (possibly rebalanced)
-        queue for further processing.
+        Globally rebalance the request queues across all servers.
         """
-        # Compute average load across all servers
-        total_prefill = sum(s.prefill_tokens * s.weight for s in server_stats)
-        total_queue_load = sum(sum(item[1][0].prompt_len for item in request_queues[i]._queue)
-                        for i in range(len(args.hosts)))
-        average_load = (total_prefill + total_queue_load) / len(args.hosts)
-
-        this_server = server_stats[server_id]
-        current_queue_load = sum(item[1][0].prompt_len for item in request_queues[server_id]._queue)
-        current_load = this_server.prefill_tokens * this_server.weight + current_queue_load
-        #print(server_id, " load: ", current_queue_load, this_server.prefill_tokens, 
-        #      current_load, '/', average_load)
-
-        # Rebalance while this server is overloaded
-        while current_load > average_load and len(request_queues[server_id]._queue) > 1:
-            if request_queues[server_id].empty():
-                break  # Nothing to rebalance
-            # Pop the oldest request (lowest timestamp) from the current server's queue
-            priority, (req_input, future) = await request_queues[server_id].get()
-
-            # Determine the target server by checking each server's prompt_len_range
-            target_server = None
-            lowest_load = float('inf')
+        
+        while True:
+            latencies = []
             for i in range(len(args.hosts)):
-                # Calculate the weighted load for server i
-                target_queue_load = sum(item[1][0].prompt_len for item in request_queues[i]._queue)
-                target_load = server_stats[i].prefill_tokens * server_stats[i].weight + target_queue_load
-                if req_input.prompt_len > server_stats[i].prompt_len_range[1]:
-                    target_load *= req_input.prompt_len / server_stats[i].prompt_len_range[1]
-                if target_load < lowest_load:
-                    lowest_load = target_load
-                    target_server = i
-
-            # Only move if a valid target server is found and it's different from the current
-            if target_server is not None and target_server != server_id:
-                await request_queues[target_server].put((req_input.timestamp, (req_input, future)))
-            else:
-                # Re-queue the request back to the original server and break to avoid an infinite loop
-                await request_queues[server_id].put((req_input.timestamp, (req_input, future)))
+                lat = estimate_server_max_latency(server_stats[i], request_queues[i])
+                latencies.append(lat)
+            H = max(range(len(latencies)), key=lambda i: latencies[i])
+            L = min(range(len(latencies)), key=lambda i: latencies[i])
+            
+            if H == L or not request_queues[H]:
                 break
 
-            # Recompute current server's load after rebalancing
-            current_queue_load = sum(item[1][0].prompt_len for item in request_queues[server_id]._queue)
-            current_load = this_server.prefill_tokens * this_server.weight + current_queue_load
-            # average_load is not updated
+            old_latency_H = latencies[H]
+            new_queue_H = request_queues[H].copy()
+            candidate_timestamp, candidate_value = new_queue_H.popitem(0)
+            new_latency_H = estimate_server_max_latency(server_stats[H], new_queue_H)
+            
+            new_queue_L = request_queues[L].copy()
+            new_queue_L[candidate_timestamp] = candidate_value
+            new_latency_L = estimate_server_max_latency(server_stats[L], new_queue_L)
+            
+            simulated_max = max(new_latency_H, new_latency_L)
+            if simulated_max < old_latency_H:
+                if not request_queues[H]:
+                    raise ValueError('queue should not be empty')
+                actual_timestamp, _ = request_queues[H].popitem(0)
+                if actual_timestamp != candidate_timestamp:
+                    raise ValueError('queue content mismatch')
+                request_queues[L][candidate_timestamp] = candidate_value
+                print("=== Rebalance attempt at time:", time.time(), "===", file=log_file)
+                for idx in range(len(args.hosts)):
+                    stats = server_stats[idx]
+                    q = request_queues[idx]
+                    print(f"Server {idx}: ttft={stats.ttft} in_flight_tokens={stats.in_flight_tokens}", file=log_file)
+                    for key, (req, _) in q.items():
+                        print(f"        Request: time = {req.timestamp}, len = {req.prompt_len}", file=log_file)
+                print(f"Moved prompt len {candidate_value[0].prompt_len} from {H} to {L}", file=log_file)
+            else:
+                break
 
-    # Build server stats for each server
-    for i in server_ids:
-        server_stats.append(ServerStat(
-            url=f"{get_base_url(i)}{args.endpoint}",
-            max_concurrency=max_concurrencys[i],
-            weight=weights[i],
-            prompt_len_range=(prompt_len_ranges[i*2], prompt_len_ranges[i*2+1])
-        ))
+            new_latency_H_actual = estimate_server_max_latency(server_stats[H], request_queues[H])
+            new_latency_L_actual = estimate_server_max_latency(server_stats[L], request_queues[L])
+            if new_latency_L_actual < new_latency_H_actual:
+                continue
+            else:
+                break
 
-    # --------------------------
-    # Request handler coroutine
-    # --------------------------
     async def request_handler(server_id: int):
         """Process requests for a specific server."""
         this_server = server_stats[server_id]
         while True:
-            if args.len_based_dispatching:
-                await rebalance_queues(server_id)
-                if this_server.prefill_tokens > this_server.max_concurrency:
-                    in_flight_sum = 0
-                    waiting_sum = 0
-                    for l in this_server.in_flight_prompt_lens:
-                        in_flight_sum += l
-                        if in_flight_sum > this_server.max_concurrency:
-                            waiting_sum += l
-                    if waiting_sum > this_server.max_concurrency:
-                        await asyncio.sleep(0.001)
-                        continue
-            # If using prompt length threshold, perform rebalancing first
-            if args.len_based_dispatching:
-                priority, (request_func_input, future) = await request_queues[server_id].get()
-            else:
-                priority, (request_func_input, future) = await request_queues[server_id].get()
+            if not request_queues[server_id]:
+                await asyncio.sleep(0.001)
+                continue
+            if this_server.in_flight_tokens > this_server.max_concurrency:
+                await asyncio.sleep(0.001)
+                continue
+            if args.len_based_dispatching >= 3:
 
-            # Set the API URL for the request
+                rebalance_queues()
+
+                if not request_queues[server_id]:
+                    await asyncio.sleep(0.001)
+                    continue
+
+            _, (request_func_input, future) = request_queues[server_id].popitem(0)
+
+            # Set the API URL and record the dispatch time.
             request_func_input.api_url = this_server.url
+            request_func_input.dispatch_timestamp = round(time.time(), 3)
             prompt_len = request_func_input.prompt_len
-            # print("run: ", server_id, prompt_len)
+
+            req_stats.add(
+                id=request_func_input.id,
+                pp=this_server.pp,
+                tp=this_server.tp,
+                in_flight_tokens=this_server.in_flight_tokens,
+                queue_tokens=sum(req.prompt_len for req, _ in request_queues[server_id].values()),
+                in_flight_prompt_lens=this_server.in_flight_prompt_lens,
+                prompt_dispatch_timestamps=this_server.prompt_dispatch_timestamps
+            )
 
             async with server_stats_condition:
                 this_server.count += 1
                 this_server.in_flight_prompt_lens.append(prompt_len)
-                this_server.prefill_tokens += prompt_len
+                this_server.prompt_dispatch_timestamps.append(request_func_input.dispatch_timestamp)
+                this_server.in_flight_tokens += prompt_len
                 this_server.prompt_lens.append(prompt_len)
-                this_server.accumulated_lens.append(this_server.prefill_tokens)
+                this_server.accumulated_lens.append(this_server.in_flight_tokens)
                 this_server.queue_latencys.append(time.time() - request_func_input.timestamp)
 
-            # Process the request using your request function
+            # Process the request.
             result = await request_func(request_func_input=request_func_input, pbar=pbar)
-
-            # Update result metadata
             result.server = this_server.url
             result.done_timestamp = time.time()
             result.ttft = result.done_timestamp - request_func_input.timestamp
@@ -798,44 +898,49 @@ async def benchmark(
             async with server_stats_condition:
                 this_server.count -= 1
                 this_server.in_flight_prompt_lens.remove(prompt_len)
-                this_server.prefill_tokens -= prompt_len
+                this_server.prompt_dispatch_timestamps.remove(request_func_input.dispatch_timestamp)
+                this_server.in_flight_tokens -= prompt_len
+                this_server.ttft = result.ttft
+                
+                req_stats.label(this_server.id, request_func_input, result.ttft, log_file)
                 server_stats_condition.notify_all()
 
             future.set_result(result)
 
-    # --------------------------
-    # Limited request function (producer)
-    # --------------------------
     async def enqueue_request(request_func_input):
-        """Adds a request to the appropriate priority queue and awaits its result."""
+        """Adds a request to the appropriate queue and awaits its result."""
         async with server_stats_condition:
-            chosen_server = get_api_url(request_func_input.prompt_len)
+            chosen_server = get_api_url(request_func_input)
         future = asyncio.Future()
-        # print("enqueue: ", request_func_input.prompt_len, " to ", chosen_server)
-        # Put the request into the chosen server's priority queue (timestamp as priority)
-        await request_queues[chosen_server].put((request_func_input.timestamp,
-                                                 (request_func_input, future)))
+        request_queues[chosen_server][request_func_input.timestamp] = (request_func_input, future)
         return await future
 
-    # --------------------------
-    # Start consumer tasks
-    # --------------------------
+    # Initialize each server's stats.
+    for i in server_ids:
+        server_stats.append(ServerStat(
+            i,
+            url=f"{get_base_url(i)}{args.endpoint}",
+            max_concurrency=max_concurrencys[i],
+            overhead=overheads[i],
+            tp=tp_degrees[i],
+            pp=pp_degrees[i],
+        ))
+
     consumer_tasks = []
     for i in server_ids:
-        for _ in range(64): #todo
+        for _ in range(64):  # Number of concurrent consumer tasks per server.
             consumer_tasks.append(asyncio.create_task(request_handler(i)))
 
-    # Set your request function based on backend
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # Adjust prompt lengths in input_requests per prompt_len_scale
+    # Adjust prompt lengths in input_requests.
     for i in range(len(input_requests)):
         input_requests[i][1] = int(input_requests[i][1] * args.prompt_len_scale)
 
-    # Optionally perform initial test run (omitted here) and reset prefix cache for each server.
+    # Reset prefix cache for each server.
     for i in server_ids:
         response = requests.post(get_base_url(i) + "/reset_prefix_cache")
         if response.status_code == 200:
@@ -843,13 +948,12 @@ async def benchmark(
         else:
             print(f"Server {i}: Failed to reset prefix cache. Status code: {response.status_code}")
 
-    # If using LoRA modules, create an iterator for them
+    # If using LoRA modules, create an iterator for them.
     if lora_modules:
         lora_modules_iter = iter([random.choice(lora_modules) for _ in range(len(input_requests))])
     else:
         lora_modules_iter = None
 
-    # Optionally start profiler (omitted for brevity)
     if profile:
         print("Starting profiler...")
         for i in server_ids:
@@ -870,15 +974,14 @@ async def benchmark(
                 print(f"Profiler started on server {i}")
 
     print(f"Traffic request rate: {request_rate}")
-    print(f"Maximum request concurrency: {max_concurrencys}")
+    if args.len_based_dispatching >= 3:
+        print(f"Max # of tokens on each instance: {max_concurrencys}")
 
     benchmark_start_time = time.perf_counter()
 
-    # --------------------------
-    # Producer: enqueue requests
-    # --------------------------
+    # Producer: enqueue requests.
     producer_tasks = []
-    async for request, current_timestamp in get_request(input_requests, request_rate, input_timestamps, args.burstiness):
+    async for request, timestamp in get_request(input_requests, request_rate, input_timestamps, args.burstiness):
         prompt, prompt_len, output_len, mm_content = request
         req_model_id, req_model_name = model_id, model_name
         if lora_modules_iter:
@@ -890,19 +993,19 @@ async def benchmark(
             model=req_model_id,
             model_name=req_model_name,
             prompt=prompt,
-            api_url="",  # will be set later in handler
+            api_url="",  # Will be set later in the handler.
             prompt_len=prompt_len,
             output_len=output_len,
             logprobs=logprobs,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
-            timestamp=time.time()
+            timestamp=time.time(),
+            id=len(producer_tasks)
         )
         producer_tasks.append(asyncio.create_task(enqueue_request(request_func_input)))
 
     print('Done enqueueing requests.')
 
-    # Wait until all in-progress requests have been processed.
     def all_requests_processed():
         return all(server_stats[i].count == 0 for i in server_ids)
 
@@ -910,15 +1013,12 @@ async def benchmark(
         await server_stats_condition.wait_for(all_requests_processed)
     print('Done processing requests.')
     for s in server_stats:    
-        print('n: ', len(s.prompt_lens), sum(s.prompt_lens))
+        print('number of prompts and tokens: ', len(s.prompt_lens), sum(s.prompt_lens))
 
-    # Gather producer results
     outputs = await asyncio.gather(*producer_tasks)
-    # Cancel consumer tasks
     for task in consumer_tasks:
         task.cancel()
 
-    # Optionally stop profiler
     if profile:
         print("Stopping profiler...")
         for i in server_ids:
@@ -939,6 +1039,7 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    print(f"Benchmark duration: {benchmark_duration} seconds")
 
     # Retrieve metrics from each server
     for i in server_ids:
@@ -981,16 +1082,22 @@ async def benchmark(
         "output_lens": actual_output_lens,
         "input_lens": [server_stats[i].prompt_lens for i in server_ids],
         "accumulated_lens": [server_stats[i].accumulated_lens for i in server_ids],
-        "queue_latencys": [server_stats[i].queue_latencys for i in server_ids],
-        "ttfts": [output.ttft for output in outputs],
-        "ttfts_host1": [output.ttft for output in outputs if args.hosts[0] in output.server],
-        "ttfts_host2": [output.ttft for output in outputs if args.hosts[0] not in output.server],
-        "itls": [output.itl for output in outputs],
-        "itls_host1": [output.itl for output in outputs if args.hosts[0] in output.server],
-        "itls_host2": [output.itl for output in outputs if args.hosts[0] not in output.server],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
+        "queue_latencys": [[round(num, 2) for num in server_stats[i].queue_latencys] for i in server_ids],
+        "ttfts": [round(output.ttft, 2) for output in outputs],
+        "ttfts_host1": [round(output.ttft, 2) for output in outputs if args.hosts[0] in output.server],
+        "ttfts_host2": [round(output.ttft, 2) for output in outputs if args.hosts[0] not in output.server],
+        #"itls": [round(output.itl, 2) for output in outputs],
+        #"itls_host1": [round(output.itl, 2) for output in outputs if args.hosts[0] in output.server],
+        #"itls_host2": [round(output.itl, 2) for output in outputs if args.hosts[0] not in output.server],
+        # "generated_texts": [output.generated_text for output in outputs],
+        # "errors": [output.error for output in outputs],
     }
+    print("{:<40} {:<10.2f}".format("P90 latency (all):", np.percentile(result['ttfts'], 90)))
+    print("{:<40} {:<10.2f}".format("P90 latency (host1):", np.percentile(result['ttfts_host1'], 90)))
+    print("{:<40} {:<10.2f}".format("P90 latency (host2):", np.percentile(result['ttfts_host2'], 90)))
+    print("{:<40} {:<10.2f}".format("P99 latency (all):", np.percentile(result['ttfts'], 99)))
+    print("{:<40} {:<10.2f}".format("P99 latency (host1):", np.percentile(result['ttfts_host1'], 99)))
+    print("{:<40} {:<10.2f}".format("P99 latency (host2):", np.percentile(result['ttfts_host2'], 99)))
 
     def process_one_metric(
         # E.g., "ttft"
@@ -1215,8 +1322,9 @@ def main(args: argparse.Namespace):
             ignore_eos=args.ignore_eos,
             goodput_config_dict=goodput_config_dict,
             max_concurrencys=args.max_concurrencys,
-            weights=args.weights,
-            prompt_len_ranges=args.prompt_len_ranges,
+            overheads=args.overheads,
+            tp_degrees=args.tp_degrees,
+            pp_degrees=args.pp_degrees,
             lora_modules=args.lora_modules,
         ))
 
@@ -1320,17 +1428,29 @@ if __name__ == "__main__":
         "actual request rate may be lower than specified with --request-rate, "
         "if the server is not processing requests fast enough to keep up.")
     parser.add_argument(
-        "--weights",
+        "--overheads",
         nargs="+",
         type=float,
         default=None,
-        help="server_load = number_of_tokens * weight")
+        help="server_load = number_of_tokens * overhead")
     parser.add_argument(
         "--prompt-len-ranges",
         nargs="+",
         type=int,
         default=None,
         help="server will mainly run the prompt len in the range")
+    parser.add_argument(
+        "--tp-degrees",
+        nargs="+",
+        type=int,
+        default=None,
+        help="server's tensor parallelism degree")
+    parser.add_argument(
+        "--pp-degrees",
+        nargs="+",
+        type=int,
+        default=None,
+        help="server's pipeline parallelism degree")
 
     parser.add_argument(
         "--model",
@@ -1598,6 +1718,6 @@ if __name__ == "__main__":
                         "script chooses a LoRA module at random.")
 
     args = parser.parse_args()
-    if -1 not in args.prompt_len_ranges:
-        args.len_based_dispatching = 1
+    if args.len_based_dispatching >= 3:
+        print("rebalance enabled; no fairness guarantee")
     main(args)

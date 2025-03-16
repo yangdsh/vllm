@@ -29,11 +29,11 @@ logger = init_logger(__name__)
 class BlockTracker:
     """Used to track the status of a block inside the prefix caching allocator
     """
-    __slots__ = ("active", "last_accessed", "computed")
+    __slots__ = ("active", "last_accessed", "computed", "cache_hint")
 
     def reset(self):
         self.last_accessed: float = _DEFAULT_LAST_ACCESSED_TIME
-        self.extra_feature: dict = {}
+        self.cache_hint: dict = None
         self.computed: bool = False
 
     def __init__(self):
@@ -49,7 +49,14 @@ class BlockTracker:
         assert self.active
         self.active = False
         self.reset()
-
+    
+    def overwrite_cache_hint(self, cache_hint):
+        if self.cache_hint is None:
+            self.cache_hint = cache_hint
+        else:
+            turns = self.cache_hint['turns']
+            self.cache_hint = cache_hint
+            self.cache_hint['turns'] = max(cache_hint['turns'], turns)
 
 class PrefixCachingBlockAllocator(BlockAllocator):
     """A block allocator that implements prefix caching.
@@ -279,7 +286,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         # (This keeps the cached block around so it can be reused)
         self.evictor.add(block_id, block.content_hash, block.num_tokens_total,
                          self._block_tracker[block_id].last_accessed,
-                         self._block_tracker[block_id].extra_feature)
+                         self._block_tracker[block_id].cache_hint)
 
         # Stop tracking the block
         self._untrack_block_id(block_id)
@@ -568,7 +575,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         return self._cow_tracker.clear_cows()
 
     def mark_blocks_as_accessed(self, block_ids: List[int],
-                                now: float, extra_feature: dict) -> None:
+                                now: float, cache_hint: dict) -> None:
         """Mark blocks as accessed, used in prefix caching.
 
         If the block is added into evictor, we need to update corresponding
@@ -578,9 +585,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         for block_id in block_ids:
             if self._block_tracker[block_id].active:
                 self._block_tracker[block_id].last_accessed = now
-                self._block_tracker[block_id].extra_feature = extra_feature
+                self._block_tracker[block_id].overwrite_cache_hint(cache_hint)
             elif block_id in self.evictor:
-                self.evictor.update(block_id, now)
+                self.evictor.update(block_id, now, cache_hint)
             else:
                 raise ValueError(
                     "Mark block as accessed which is not belonged to GPU")
@@ -1105,34 +1112,41 @@ class LastAccessBlocksTracker:
     def __init__(self, allocator):
         self._allocator = allocator
         self._seq_last_access: Dict[int, Optional[float]] = {}
+        self._seq_cache_hint: dict = {}
 
     def add_seq(self, seq_id: int) -> None:
         """Start tracking seq_id
         """
         assert seq_id not in self._seq_last_access
         self._seq_last_access[seq_id] = None
+        self._seq_cache_hint[seq_id] = {}
 
     def remove_seq(self, seq_id: int) -> None:
         """Stop tracking seq_id
         """
         assert seq_id in self._seq_last_access
         del self._seq_last_access[seq_id]
+        del self._seq_cache_hint[seq_id]
 
     def update_last_access(self, seq_id: int, time: float) -> None:
         assert seq_id in self._seq_last_access
         self._seq_last_access[seq_id] = time
 
-    def update_seq_blocks_last_access(self, seq_id: int,
+    def update_cache_hint(self, seq_id: int, cache_hint: dict) -> None:    
+        self._seq_cache_hint[seq_id] = cache_hint
+
+    def update_blocks_metadata_using_seq_metadata(self, seq_id: int,
                                       block_ids: List[int]) -> None:
         assert seq_id in self._seq_last_access
 
         ts = self._seq_last_access[seq_id]
+        cache_hint = self._seq_cache_hint[seq_id]
 
         if ts is None:
             # No last access was recorded, no need to update.
             return
 
-        self._allocator.mark_blocks_as_accessed(block_ids, ts)
+        self._allocator.mark_blocks_as_accessed(block_ids, ts, cache_hint)
 
 
 def assert_prefix_caching_block_or_none(block: Optional[Block]):

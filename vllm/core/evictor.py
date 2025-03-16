@@ -35,12 +35,12 @@ class Evictor(ABC):
 
     @abstractmethod
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
-            last_accessed: float, extra_feature: dict):
+            last_accessed: float, cache_hint: dict):
         """Adds block to the evictor, making it a candidate for eviction"""
         pass
 
     @abstractmethod
-    def update(self, block_id: int, last_accessed: float):
+    def update(self, block_id: int, last_accessed: float, cache_hint: dict):
         """Update corresponding block's access time in metadata"""
         pass
 
@@ -64,21 +64,30 @@ class BlockMetaData:
     """
 
     def __init__(self, content_hash: int, num_hashed_tokens: int,
-                 last_accessed: float, extra_feature: dict = {}):
+                 last_accessed: float, cache_hint: dict = None, score: float = 0):
         self.content_hash = content_hash
         self.num_hashed_tokens = num_hashed_tokens
         self.last_accessed = last_accessed
-        self.extra_feature = extra_feature
+        self.cache_hint = cache_hint
+        self.score = score
 
 class LRUMLEvictor(Evictor):
     CLEANUP_THRESHOLD = 50
+    def parse_str_to_dict(self, s: str) -> dict:
+        if len(s)==0:
+            return {}
+        return {key: value for key, value in (pair.split("=", 1) for pair in s.split(","))}
 
-    def __init__(self):
+    def __init__(self, config):
         self.free_table: Dict[int, BlockMetaData] = {}
         self.priority_queue = []
+        self.config = self.parse_str_to_dict(config)
 
     def __contains__(self, block_id: int) -> bool:
         return block_id in self.free_table
+    
+    def calc_score(self, last_accessed, cache_hint):
+        return last_accessed + cache_hint['turns']
 
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
@@ -90,31 +99,35 @@ class LRUMLEvictor(Evictor):
             # entries are filtered out here during eviction. Outdated entries
             # would either not in the free table, or have older last accessed
             # time.
-            last_accessed, _, block_id, content_hash = heapq.heappop(
+            score, _, block_id, content_hash = heapq.heappop(
                 self.priority_queue)
             if (block_id in self.free_table and
-                    self.free_table[block_id].last_accessed == last_accessed):
+                    self.free_table[block_id].score == score):
                 self.free_table.pop(block_id)
                 return block_id, content_hash
 
         raise ValueError("No usable cache memory left")
 
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
-            last_accessed: float, extra_feature: dict):
+            last_accessed: float, cache_hint: dict):
+        score = self.calc_score(last_accessed, cache_hint)
         self.free_table[block_id] = BlockMetaData(content_hash,
                                                   num_hashed_tokens,
                                                   last_accessed,
-                                                  extra_feature)
+                                                  cache_hint,
+                                                  score)
         heapq.heappush(
             self.priority_queue,
-            (last_accessed, -num_hashed_tokens, block_id, content_hash))
+            (self.free_table[block_id].score, -num_hashed_tokens, block_id, content_hash))
         self._cleanup_if_necessary()
 
-    def update(self, block_id: int, last_accessed: float):
+    def update(self, block_id: int, last_accessed: float, cache_hint: dict):
         self.free_table[block_id].last_accessed = last_accessed
+        self.free_table[block_id].cache_hint = cache_hint
+        self.free_table[block_id].score = self.calc_score(last_accessed, cache_hint)
 
     def _cleanup_if_necessary(self):
-        if len(self.priority_queue) > LRUEvictor.CLEANUP_THRESHOLD * len(
+        if len(self.priority_queue) < LRUEvictor.CLEANUP_THRESHOLD * len(
                 self.free_table):
             self._cleanup()
 
@@ -123,7 +136,7 @@ class LRUMLEvictor(Evictor):
 
         for block_id, block in self.free_table.items():
             new_priority_queue.append(
-                (block.last_accessed, -block.num_hashed_tokens, block_id,
+                (block.score, -block.num_hashed_tokens, block_id,
                  block.content_hash))
         heapq.heapify(new_priority_queue)
 
@@ -179,17 +192,19 @@ class LRUEvictor(Evictor):
         raise ValueError("No usable cache memory left")
 
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
-            last_accessed: float, extra_feature: dict):
+            last_accessed: float, cache_hint: dict):
         self.free_table[block_id] = BlockMetaData(content_hash,
                                                   num_hashed_tokens,
-                                                  last_accessed)
+                                                  last_accessed,
+                                                  cache_hint)
         heapq.heappush(
             self.priority_queue,
             (last_accessed, -num_hashed_tokens, block_id, content_hash))
         self._cleanup_if_necessary()
 
-    def update(self, block_id: int, last_accessed: float):
+    def update(self, block_id: int, last_accessed: float, cache_hint: dict):
         self.free_table[block_id].last_accessed = last_accessed
+        self.free_table[block_id].cache_hint = cache_hint
 
     def _cleanup_if_necessary(self):
         if len(self.priority_queue) > LRUEvictor.CLEANUP_THRESHOLD * len(
@@ -222,6 +237,8 @@ def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
     if eviction_algorithm == 'lru':
         return LRUEvictor()
     elif eviction_algorithm == 'lru-ml':
+        return LRUMLEvictor(config)
+    elif eviction_algorithm == 'lruml':
         return LRUMLEvictor(config)
     else:
         raise ValueError(f"Unknown cache eviction policy: {eviction_algorithm}")

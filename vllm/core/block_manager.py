@@ -262,7 +262,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             return
 
         # Update seq block ids with the latest access time
-        self._last_access_blocks_tracker.update_seq_blocks_last_access(
+        self._last_access_blocks_tracker.update_blocks_metadata_using_seq_metadata(
             seq_id, self.block_tables[seq.seq_id].physical_block_ids)
 
         # Untrack seq
@@ -301,6 +301,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # (This avoids expensive calls to mark_blocks_as_accessed(..))
             self._last_access_blocks_tracker.update_last_access(
                 seq.seq_id, now)
+            self._last_access_blocks_tracker.update_cache_hint(
+                seq.seq_id, seq.cache_hint)
 
     def mark_blocks_as_computed(self, seq_group: SequenceGroup,
                                 token_chunk_size: int):

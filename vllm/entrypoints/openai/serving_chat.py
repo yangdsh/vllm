@@ -252,6 +252,9 @@ class OpenAIServingChat(OpenAIServing):
 
                 generators.append(generator)
         except ValueError as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print("Exception in create_chat_completion:\n", error_details)
             # TODO: Use a vllm-specific Validation Error
             return self.create_error_response(str(e))
 

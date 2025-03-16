@@ -29,6 +29,7 @@ import gc
 import json
 import os
 import random
+import requests
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable
@@ -294,9 +295,14 @@ async def benchmark(
     if not test_output.success:
         raise ValueError(
             "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
+            f"are correctly specified. Error: {test_output}")
     else:
         print("Initial test run completed. Starting main benchmark run...")
+    response = requests.post(base_url + "/reset_prefix_cache")
+    if response.status_code == 200:
+        print("Prefix cache reset successfully.")
+    else:
+        print(f"Failed to reset prefix cache. Status code: {response.status_code}")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -348,9 +354,9 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request.prompt, \
+        prompt, prompt_len, output_len, mm_content, conversation_id = request.prompt, \
             request.prompt_len, request.expected_output_len, \
-                request.multi_modal_data
+                request.multi_modal_data, request.conversation_id
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -364,7 +370,8 @@ async def benchmark(
                                               output_len=output_len,
                                               logprobs=logprobs,
                                               multi_modal_content=mm_content,
-                                              ignore_eos=ignore_eos)
+                                              ignore_eos=ignore_eos,
+                                              conversation_id=conversation_id)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -399,6 +406,12 @@ async def benchmark(
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
     )
+    metrics_url = f"{base_url}/metrics"
+    response = requests.get(metrics_url)
+    for line in response.text.split("\n"):
+        if "gpu_prefix_cache_hit_rate{" in line:
+            print(line)
+            hit_ratio=line.split(' ')[-1]
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -420,6 +433,7 @@ async def benchmark(
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
+        "hit_ratio": hit_ratio,
         "total_input_tokens": metrics.total_input,
         "total_output_tokens": metrics.total_output,
         "request_throughput": metrics.request_throughput,
@@ -713,7 +727,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="vllm",
+        default="openai-chat",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
     )
     parser.add_argument(

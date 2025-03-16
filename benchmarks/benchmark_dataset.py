@@ -51,6 +51,7 @@ class SampleRequest:
     expected_output_len: int
     multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
     lora_request: Optional[LoRARequest] = None
+    conversation_id: int = -1
 
 
 # -----------------------------------------------------------------------------
@@ -317,6 +318,7 @@ class ShareGPTDataset(BenchmarkDataset):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.load_data()
+        self.conversation_id = 0
 
     def load_data(self) -> None:
         if self.dataset_path is None:
@@ -341,30 +343,36 @@ class ShareGPTDataset(BenchmarkDataset):
                **kwargs) -> list:
         samples: list = []
         for entry in self.data:
-            if len(samples) >= num_requests:
-                break
-            prompt, completion = entry["conversations"][0]["value"],\
-                entry["conversations"][1]["value"]
+            for turn in range(len(entry["conversations"])//2):
+                if len(samples) >= num_requests:
+                    break
+                if turn * 2 + 1 >= len(entry["conversations"]):
+                    break
+                prompt, completion = entry["conversations"][turn * 2]["value"],\
+                    entry["conversations"][turn * 2 + 1]["value"]
 
-            lora_request, tokenizer = self.get_random_lora_request(
-                tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
-            prompt_ids = tokenizer(prompt).input_ids
-            completion_ids = tokenizer(completion).input_ids
-            prompt_len = len(prompt_ids)
-            new_output_len = (len(completion_ids)
-                              if output_len is None else output_len)
-            if not is_valid_sequence(prompt_len,
-                                     new_output_len,
-                                     skip_min_output_len_check=output_len
-                                     is not None):
-                continue
-            samples.append(
-                SampleRequest(
-                    prompt=prompt,
-                    prompt_len=prompt_len,
-                    expected_output_len=new_output_len,
-                    lora_request=lora_request,
-                ))
+                lora_request, tokenizer = self.get_random_lora_request(
+                    tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
+                prompt_ids = tokenizer(prompt).input_ids
+                completion_ids = tokenizer(completion).input_ids
+                prompt_len = len(prompt_ids)
+                new_output_len = (len(completion_ids)
+                                if output_len is None else output_len)
+                if not is_valid_sequence(prompt_len,
+                                        new_output_len,
+                                        skip_min_output_len_check=output_len
+                                        is not None):
+                    continue
+                samples.append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=prompt_len,
+                        expected_output_len=new_output_len,
+                        lora_request=lora_request,
+                        conversation_id=self.conversation_id
+                    ))
+            self.conversation_id += 1
+        random.shuffle(samples) # todo
         return samples
 
 

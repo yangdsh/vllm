@@ -5,6 +5,7 @@ import os
 import sys
 import time
 import traceback
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -32,6 +33,9 @@ class RequestFuncInput:
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
     timestamp: float = 0
+    id: int = 0
+    conversation_id: int = -1
+    predicted_latency: float = 0
 
 
 @dataclass
@@ -339,26 +343,45 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
-    async with aiohttp.ClientSession(trust_env=True,
-                                     timeout=AIOHTTP_TIMEOUT) as session:
+    conversation_history = defaultdict(list)
+    
+    def get_messages(request_func_input):
+        conversation_id = request_func_input.conversation_id
         content = [{"type": "text", "text": request_func_input.prompt}]
         if request_func_input.multi_modal_content:
             content.append(request_func_input.multi_modal_content)
+        message = {
+                "role": "user",
+                "content": content
+            }
+        conversation_history[conversation_id].append(message)
+        return conversation_history[conversation_id]
+    
+    def get_cache_hint(request_func_input):
+        conversation_id = request_func_input.conversation_id
+        return {"turns": len(conversation_history[conversation_id])}
+    
+    def update_conversation(conversation_id, generated_text):
+        conversation_history[conversation_id].append(
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": generated_text}]
+            }
+        )
+    
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
             "model": request_func_input.model_name \
                 if request_func_input.model_name else request_func_input.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content
-                },
-            ],
+            "messages": get_messages(request_func_input),
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": True,
             "stream_options": {
                 "include_usage": True,
             },
+            "cache_hint": get_cache_hint(request_func_input),
         }
         if request_func_input.ignore_eos:
             payload["ignore_eos"] = request_func_input.ignore_eos
@@ -411,11 +434,16 @@ async def async_request_openai_chat_completions(
                             most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
+                    update_conversation(request_func_input.conversation_id, generated_text)
                     output.success = True
                     output.latency = most_recent_timestamp - st
                 else:
                     output.error = response.reason or ""
                     output.success = False
+                    error_text = await response.text()
+                    print("Response status:", response.status)
+                    print("Response headers:", response.headers)
+                    print("Response body:", error_text)
         except Exception:
             output.success = False
             exc_info = sys.exc_info()

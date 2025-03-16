@@ -283,7 +283,8 @@ class MQLLMEngine:
                 lora_request=request.lora_request,
                 trace_headers=request.trace_headers,
                 prompt_adapter_request=request.prompt_adapter_request,
-                priority=request.priority)
+                priority=request.priority,
+                cache_hint=request.cache_hint)
 
             if self.log_requests:
                 logger.info("Added request %s.", request.request_id)
