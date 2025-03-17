@@ -651,7 +651,7 @@ class TestPrefixCachingBlockAllocator:
 
         # Set the last accessed time of the first block to 1
         blocks_ids = [block.block_id for block in first_chain]
-        allocator.mark_blocks_as_accessed(blocks_ids, 1)
+        allocator.mark_blocks_as_accessed(blocks_ids, 1, {})
 
         # Second chain takes the rest of the blocks
         second_chain = TestPrefixCachingBlockAllocator.create_immutable_chain(
@@ -672,7 +672,7 @@ class TestPrefixCachingBlockAllocator:
         # Set the last accessed time on all of the blocks in the second chain
         # to 2
         blocks_ids = [block.block_id for block in second_chain]
-        allocator.mark_blocks_as_accessed(blocks_ids, 2)
+        allocator.mark_blocks_as_accessed(blocks_ids, 2, {})
 
         # Free each block in the second chain.
         for i, block in enumerate(second_chain):

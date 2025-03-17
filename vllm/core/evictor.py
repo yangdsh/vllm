@@ -87,7 +87,14 @@ class LRUMLEvictor(Evictor):
         return block_id in self.free_table
     
     def calc_score(self, last_accessed, cache_hint):
-        return last_accessed + cache_hint['turns']
+        if 'next_timestamp' in cache_hint:
+            return -cache_hint['next_timestamp']
+
+        # shareGPT heuristic: assuming exponential distribution
+        if cache_hint['turns'] <= 6:
+            return 6-cache_hint['turns'] + last_accessed
+        else:
+            return max(cache_hint['turns']-6, 10) + last_accessed
 
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
@@ -127,7 +134,7 @@ class LRUMLEvictor(Evictor):
         self.free_table[block_id].score = self.calc_score(last_accessed, cache_hint)
 
     def _cleanup_if_necessary(self):
-        if len(self.priority_queue) < LRUEvictor.CLEANUP_THRESHOLD * len(
+        if len(self.priority_queue) > LRUEvictor.CLEANUP_THRESHOLD * len(
                 self.free_table):
             self._cleanup()
 

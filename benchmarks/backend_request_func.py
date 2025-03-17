@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import aiohttp
+import asyncio
 import huggingface_hub.constants
+import requests
 from tqdm.asyncio import tqdm
 from transformers import (AutoTokenizer, PreTrainedTokenizer,
                           PreTrainedTokenizerFast)
@@ -33,8 +35,10 @@ class RequestFuncInput:
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
     timestamp: float = 0
+    next_timestamp: float = 0
     id: int = 0
     conversation_id: int = -1
+    turn_id: int = -1
     predicted_latency: float = 0
 
 
@@ -334,32 +338,47 @@ async def async_request_openai_completions(
     return output
 
 
+conversation_history = defaultdict(list)
+start_time = 0
+n_completed_req = 0
+n_running_req = 0
+
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
+    global n_running_req
+    global n_completed_req
+    global start_time
     api_url = request_func_input.api_url
     assert api_url.endswith(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
-    conversation_history = defaultdict(list)
-    
+    while len(conversation_history[request_func_input.conversation_id]) != request_func_input.turn_id \
+            and request_func_input.turn_id >= 0:
+        await asyncio.sleep(0.01)
+    if request_func_input.conversation_id == 0 and request_func_input.turn_id == 0:
+        start_time = time.time()
+
     def get_messages(request_func_input):
         conversation_id = request_func_input.conversation_id
         content = [{"type": "text", "text": request_func_input.prompt}]
         if request_func_input.multi_modal_content:
             content.append(request_func_input.multi_modal_content)
-        message = {
+        user_message = {
                 "role": "user",
                 "content": content
             }
-        conversation_history[conversation_id].append(message)
+        conversation_history[conversation_id].append(user_message)
         return conversation_history[conversation_id]
     
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
-        return {"turns": len(conversation_history[conversation_id])}
+        return {"turns": len(conversation_history[conversation_id]), 
+                "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
+                # "next_timestamp": request_func_input.next_timestamp
+                }
     
     def update_conversation(conversation_id, generated_text):
         conversation_history[conversation_id].append(
@@ -399,6 +418,9 @@ async def async_request_openai_chat_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        n_running_req += 1
+        #print(round(time.time()-start_time,2), request_func_input.timestamp, 
+        #      request_func_input.conversation_id, n_completed_req)
         try:
             async with session.post(url=api_url, json=payload,
                                     headers=headers) as response:
@@ -437,6 +459,8 @@ async def async_request_openai_chat_completions(
                     update_conversation(request_func_input.conversation_id, generated_text)
                     output.success = True
                     output.latency = most_recent_timestamp - st
+                    #print(request_func_input.conversation_id, request_func_input.turn_id,
+                    #    len(output.itl), request_func_input.output_len, output.latency)
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -448,6 +472,14 @@ async def async_request_openai_chat_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        n_running_req -= 1
+        n_completed_req += 1
+        if n_completed_req % 100 == 0:
+            metrics_url = f"{request_func_input.api_url.replace("v1/chat/completions", "")}metrics"
+            response = requests.get(metrics_url)
+            for line in response.text.split("\n"):
+                if "gpu_prefix_cache_hit_rate{" in line:
+                    print(line)
 
     if pbar:
         pbar.update(1)

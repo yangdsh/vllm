@@ -114,18 +114,26 @@ async def get_request(
             in more bursty requests, while a higher burstiness value
             (burstiness > 1) results in a more uniform arrival of requests.
     """
-    input_requests: Iterable[SampleRequest] = iter(input_requests)
+    input_requests_: Iterable[SampleRequest] = iter(input_requests)
 
     # Calculate scale parameter theta to maintain the desired request_rate.
     assert burstiness > 0, (
         f"A positive burstiness factor is expected, but given {burstiness}.")
     theta = 1.0 / (request_rate * burstiness)
 
-    for request in input_requests:
+    for i, request in enumerate(input_requests_):
         yield request
 
         if request_rate == float("inf"):
             # If the request rate is infinity, then we don't need to wait.
+            continue
+
+        if request.timestamp != 0:
+            if i < len(input_requests) - 1:
+                interval = input_requests[i+1].timestamp - input_requests[i].timestamp
+            else:
+                interval = 0
+            await asyncio.sleep(interval)
             continue
 
         # Sample the request interval from the gamma distribution.
@@ -353,10 +361,14 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    last_conversation_id = max(input_requests, key=lambda x: x.conversation_id).conversation_id
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content, conversation_id = request.prompt, \
+        prompt, prompt_len, output_len, mm_content, conversation_id, turn_id = request.prompt, \
             request.prompt_len, request.expected_output_len, \
-                request.multi_modal_data, request.conversation_id
+                request.multi_modal_data, request.conversation_id, request.turn_id
+        if last_conversation_id > 0 and conversation_id == last_conversation_id:
+            # skip cool down
+            break
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
@@ -371,7 +383,10 @@ async def benchmark(
                                               logprobs=logprobs,
                                               multi_modal_content=mm_content,
                                               ignore_eos=ignore_eos,
-                                              conversation_id=conversation_id)
+                                              conversation_id=conversation_id,
+                                              turn_id=turn_id,
+                                              timestamp=request.timestamp,
+                                              next_timestamp=request.next_timestamp)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -444,9 +459,9 @@ async def benchmark(
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
+        #"itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
+        #"errors": [output.error for output in outputs],
     }
 
     def process_one_metric(

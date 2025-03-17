@@ -52,6 +52,9 @@ class SampleRequest:
     multi_modal_data: Optional[Union[MultiModalDataDict, dict]] = None
     lora_request: Optional[LoRARequest] = None
     conversation_id: int = -1
+    turn_id: int = -1
+    timestamp: int = 0
+    next_timestamp: int = 1e9
 
 
 # -----------------------------------------------------------------------------
@@ -340,9 +343,16 @@ class ShareGPTDataset(BenchmarkDataset):
                lora_path: Optional[str] = None,
                max_loras: Optional[int] = None,
                output_len: Optional[int] = None,
+               conv_scale: float = 0.25,
+               req_scale: float = 10,
                **kwargs) -> list:
         samples: list = []
+        conv_timestamp = 0
         for entry in self.data:
+            #if len(entry["conversations"])//2 != 1:
+            #    continue
+            conv_timestamp += np.random.exponential(conv_scale)
+            req_timestamp = conv_timestamp
             for turn in range(len(entry["conversations"])//2):
                 if len(samples) >= num_requests:
                     break
@@ -358,21 +368,29 @@ class ShareGPTDataset(BenchmarkDataset):
                 prompt_len = len(prompt_ids)
                 new_output_len = (len(completion_ids)
                                 if output_len is None else output_len)
-                if not is_valid_sequence(prompt_len,
-                                        new_output_len,
-                                        skip_min_output_len_check=output_len
-                                        is not None):
-                    continue
+                #if turn == len(entry["conversations"])//2 - 1:
+                #    new_output_len = 1
+                #if not is_valid_sequence(prompt_len,
+                #                        new_output_len,
+                #                        skip_min_output_len_check=output_len
+                #                        is not None):
+                #    continue
                 samples.append(
                     SampleRequest(
                         prompt=prompt,
                         prompt_len=prompt_len,
                         expected_output_len=new_output_len,
                         lora_request=lora_request,
-                        conversation_id=self.conversation_id
+                        conversation_id=self.conversation_id,
+                        turn_id=turn*2,
+                        timestamp=req_timestamp,
                     ))
+                req_timestamp += np.random.exponential(req_scale)
+                if (turn+1) * 2 + 1 < len(entry["conversations"]):
+                    samples[-1].next_timestamp = req_timestamp
             self.conversation_id += 1
-        random.shuffle(samples) # todo
+        # random.shuffle(samples) # todo
+        samples.sort(key=lambda x: x.timestamp)
         return samples
 
 

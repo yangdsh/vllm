@@ -852,9 +852,12 @@ async def benchmark(
             if not request_queues[server_id]:
                 await asyncio.sleep(0.001)
                 continue
-            if this_server.in_flight_tokens > this_server.max_concurrency:
+
+            if this_server.in_flight_tokens > this_server.max_concurrency and \
+                    len(this_server.in_flight_prompt_lens) > this_server.pp:
                 await asyncio.sleep(0.001)
                 continue
+
             if args.len_based_dispatching >= 3:
 
                 rebalance_queues()
