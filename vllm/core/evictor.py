@@ -6,6 +6,7 @@ import time
 import statistics
 import numpy as np
 from collections import defaultdict
+from sortedcontainers import SortedDict
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
 
@@ -82,16 +83,18 @@ class CacheStat:
         if current_time - self.last_log_time < self.log_interval:
             return 0
         self.last_log_time = current_time
+        has_data = 0
 
         for key in self.stat.keys():
             data = self.stat[key]
             if not data:
-                return 0
+                continue
             
             mean = statistics.mean(data)
             std_dev = statistics.stdev(data) if len(data) > 1 else 0
             print(f"Summary for {key}: Mean = {mean:.2f}, Std Dev = {std_dev:.2f}")
-        return 1
+            has_data = 1
+        return has_data
         
 
 class BlockMetaData:
@@ -110,14 +113,18 @@ class BlockMetaData:
         self.cache_hint = cache_hint
         self.score = score
 
-class LRUMLEvictor:
+class LRUMLEvictor(Evictor):
 
     def __init__(self, config):
         self.free_table: Dict[int, BlockMetaData] = {}
-        self.priority_queue = []
-        self.queue_map: Dict[int, Tuple[float, int, int, int]] = {}  # Maps block_id to priority queue entry
+        self.sorted_dict = SortedDict()
         self.config = self.parse_str_to_dict(config)
+        self.stat = CacheStat()
         self.last_clean_time = time.time()
+        self.INSPECT_INTERVAL = 10
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self.free_table
 
     def parse_str_to_dict(self, s: str) -> dict:
         if len(s) == 0:
@@ -148,52 +155,61 @@ class LRUMLEvictor:
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
             raise ValueError("No usable cache memory left")
-        
-        while self.priority_queue:
-            score, _, block_id, content_hash = heapq.heappop(self.priority_queue)
-            if block_id in self.free_table and self.free_table[block_id].score == score:
-                del self.queue_map[block_id]  # Remove from tracking
-                self.free_table.pop(block_id)
-                return block_id, content_hash
+        if time.time() - self.last_clean_time > self.INSPECT_INTERVAL:
+            self.last_clean_time = time.time()
+            stat_ = CacheStat()
+            print('Sampled blocks in the cache:')
+            for block_id in self.free_table:
+                survival_time = time.time() - self.free_table[block_id].last_accessed
+                stat_.append("survival_times", survival_time)
+                if block_id % 500 == 0:
+                    print(self.free_table[block_id].cache_hint, self.free_table[block_id].score, self.free_table[block_id].last_accessed)
+            print('For all blocks in the cache:')
+            stat_.summary()
+
+        _, (block_id, content_hash) = self.sorted_dict.popitem(0)  # Remove smallest score
+        if block_id in self.free_table:
+            survival_time = time.time() - self.free_table[block_id].last_accessed
+            self.stat.append("survival_times", survival_time)
+            del self.free_table[block_id]
+            return block_id, content_hash
+        else:
+            print('block is not in the sorted dict')
 
         raise ValueError("No usable cache memory left")
 
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
         score = self.calc_score(last_accessed, cache_hint)
-        metadata = BlockMetaData(content_hash, num_hashed_tokens, last_accessed, cache_hint, score)
-        self.free_table[block_id] = metadata
-        entry = (score, -num_hashed_tokens, block_id, content_hash)
-        heapq.heappush(self.priority_queue, entry)
-        self.queue_map[block_id] = entry  # Track position in queue
+        self.free_table[block_id] = BlockMetaData(content_hash,
+                                                  num_hashed_tokens,
+                                                  last_accessed,
+                                                  cache_hint,
+                                                  score)
+        self.sorted_dict[(score, block_id)] = (block_id, content_hash)
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
-        if block_id not in self.free_table:
-            raise ValueError("Block ID not found in free table")
+        if block_id in self.free_table:
+            old_score = self.free_table[block_id].score
+            old_entry = (old_score, block_id)
+            if old_entry in self.sorted_dict:
+                del self.sorted_dict[old_entry]
         
+        score = self.calc_score(last_accessed, cache_hint)
         self.free_table[block_id].last_accessed = last_accessed
         self.free_table[block_id].cache_hint = cache_hint
-        self.free_table[block_id].score = self.calc_score(last_accessed, cache_hint)
+        self.free_table[block_id].score = score
         
-        # Remove outdated entry and insert updated one
-        if block_id in self.queue_map:
-            old_entry = self.queue_map.pop(block_id)
-            self.priority_queue.remove(old_entry)
-            heapq.heapify(self.priority_queue)
-        
-        new_entry = (self.free_table[block_id].score, -self.free_table[block_id].num_hashed_tokens, block_id, self.free_table[block_id].content_hash)
-        heapq.heappush(self.priority_queue, new_entry)
-        self.queue_map[block_id] = new_entry
+        self.sorted_dict[(score, block_id)] = (block_id, self.free_table[block_id].content_hash)
 
     def remove(self, block_id: int):
         if block_id not in self.free_table:
             raise ValueError("Attempting to remove block that's not in the evictor")
         
-        if block_id in self.queue_map:
-            old_entry = self.queue_map.pop(block_id)
-            self.priority_queue.remove(old_entry)
-            heapq.heapify(self.priority_queue)
-        
+        old_score = self.free_table[block_id].score
+        old_entry = (old_score, block_id)
+        if old_entry in self.sorted_dict:
+            del self.sorted_dict[old_entry]
         del self.free_table[block_id]
 
     @property

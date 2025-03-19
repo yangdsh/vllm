@@ -259,19 +259,21 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         if seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.
+            print("freed: ", seq.cache_hint)
             return
 
         # Update seq block ids with the latest access time
         self._last_access_blocks_tracker.update_blocks_metadata_using_seq_metadata(
             seq_id, self.block_tables[seq.seq_id].physical_block_ids)
 
-        # Untrack seq
-        self._last_access_blocks_tracker.remove_seq(seq_id)
-        self._computed_blocks_tracker.remove_seq(seq_id)
-
         # Free table/blocks
         self.block_tables[seq_id].free()
-        del self.block_tables[seq_id]
+
+        if seq.cache_hint['true_tta'] > 10:
+            # Untrack seq
+            del self.block_tables[seq_id]
+            self._last_access_blocks_tracker.remove_seq(seq_id)
+            self._computed_blocks_tracker.remove_seq(seq_id)
 
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id

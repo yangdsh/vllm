@@ -54,9 +54,9 @@ class BlockTracker:
         if self.cache_hint is None:
             self.cache_hint = cache_hint
         else:
-            turns = self.cache_hint['turns']
-            self.cache_hint = cache_hint
-            self.cache_hint['turns'] = max(cache_hint['turns'], turns)
+            # todo: keep the one with smaller TTA
+            if self.cache_hint['turns'] < cache_hint['turns']:
+                self.cache_hint = cache_hint
 
 class PrefixCachingBlockAllocator(BlockAllocator):
     """A block allocator that implements prefix caching.
@@ -193,7 +193,6 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         assert block.content_hash is not None
 
         cached_block_id = self._cached_blocks.get(block.content_hash, None)
-        # print(token_ids, cached_block_id, prev_block.block_id if prev_block is not None else -1)
         if cached_block_id is not None:
             self.metric_data.query(hit=True)
             block.block_id = cached_block_id
@@ -453,9 +452,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         return self._hashless_allocator.all_block_ids
 
     def get_prefix_cache_hit_rate(self) -> float:
-        should_print = self.evictor.stat.summary()
-        if should_print:
-            print(len(self.evictor.free_table), len(self.evictor.priority_queue))
+        has_data = self.evictor.stat.summary()
+        if has_data:
+            print('Number of reusable blocks in the cache: ', len(self.evictor.free_table))
         return self.metric_data.get_hit_rate()
 
     def reset_prefix_cache(self) -> bool:
@@ -1129,6 +1128,8 @@ class LastAccessBlocksTracker:
         """
         assert seq_id in self._seq_last_access
         del self._seq_last_access[seq_id]
+        #if self._seq_cache_hint[seq_id]['id'] in [86, 385, 800]:
+        #    print('remove: ', seq_id, self._seq_cache_hint[seq_id])
         del self._seq_cache_hint[seq_id]
 
     def update_last_access(self, seq_id: int, time: float) -> None:
@@ -1136,7 +1137,13 @@ class LastAccessBlocksTracker:
         self._seq_last_access[seq_id] = time
 
     def update_cache_hint(self, seq_id: int, cache_hint: dict) -> None:    
-        self._seq_cache_hint[seq_id] = cache_hint
+        #if cache_hint['id'] in [86, 385, 800]:
+        #    print('update: ', seq_id, cache_hint)
+        if seq_id not in self._seq_cache_hint[seq_id]:
+            self._seq_cache_hint[seq_id] = cache_hint
+        else:
+            if self._seq_cache_hint[seq_id]['turns'] < cache_hint['turns']:
+                self._seq_cache_hint[seq_id] = cache_hint
 
     def update_blocks_metadata_using_seq_metadata(self, seq_id: int,
                                       block_ids: List[int]) -> None:

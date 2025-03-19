@@ -376,10 +376,11 @@ async def async_request_openai_chat_completions(
     
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
-        return {"turns": len(conversation_history[conversation_id]),
-                "prob_has_next": request_func_input.next_timestamp < 1e8,
+        return {"turns": len(conversation_history[conversation_id]) // 2,
+                "prob_has_next": (request_func_input.next_timestamp < 1e8) * 0.9,
                 "exp_scale": request_func_input.exp_scale,
                 "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
+                "id": conversation_id
                 # "next_timestamp": request_func_input.next_timestamp
                 }
     
@@ -405,6 +406,8 @@ async def async_request_openai_chat_completions(
             },
             "cache_hint": get_cache_hint(request_func_input),
         }
+        #if request_func_input.conversation_id in [39, 86]:
+        #    print(request_func_input, get_cache_hint(request_func_input))
         if request_func_input.ignore_eos:
             payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:
