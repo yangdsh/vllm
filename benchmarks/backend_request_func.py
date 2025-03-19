@@ -40,6 +40,7 @@ class RequestFuncInput:
     conversation_id: int = -1
     turn_id: int = -1
     predicted_latency: float = 0
+    exp_scale: float = 1
 
 
 @dataclass
@@ -375,7 +376,9 @@ async def async_request_openai_chat_completions(
     
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
-        return {"turns": len(conversation_history[conversation_id]), 
+        return {"turns": len(conversation_history[conversation_id]),
+                "prob_has_next": request_func_input.next_timestamp < 1e8,
+                "exp_scale": request_func_input.exp_scale,
                 "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
                 # "next_timestamp": request_func_input.next_timestamp
                 }

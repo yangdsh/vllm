@@ -386,7 +386,8 @@ async def benchmark(
                                               conversation_id=conversation_id,
                                               turn_id=turn_id,
                                               timestamp=request.timestamp,
-                                              next_timestamp=request.next_timestamp)
+                                              next_timestamp=request.next_timestamp,
+                                              exp_scale=1/args.request_rate)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -640,6 +641,7 @@ def main(args: argparse.Namespace):
                                         tokenizer=tokenizer,
                                         num_requests=args.num_prompts,
                                         output_len=args.sharegpt_output_len,
+                                        req_scale=1/args.request_rate
                                     ),
             "burstgpt":
             lambda: BurstGPTDataset(random_seed=args.seed,
@@ -821,7 +823,8 @@ if __name__ == "__main__":
         help="Number of requests per second. If this is inf, "
         "then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process or gamma distribution "
-        "to synthesize the request arrival times.",
+        "to synthesize the request arrival times."
+        "For ShareGPT dataset, this is the request rate within each conversation",
     )
     parser.add_argument(
         "--burstiness",

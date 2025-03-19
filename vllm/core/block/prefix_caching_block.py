@@ -453,6 +453,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         return self._hashless_allocator.all_block_ids
 
     def get_prefix_cache_hit_rate(self) -> float:
+        should_print = self.evictor.stat.summary()
+        if should_print:
+            print(len(self.evictor.free_table), len(self.evictor.priority_queue))
         return self.metric_data.get_hit_rate()
 
     def reset_prefix_cache(self) -> bool:
