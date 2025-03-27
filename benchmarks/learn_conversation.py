@@ -25,19 +25,6 @@ def calculate_label_distribution(predictions):
     distribution = {label: (count / total) * 100 for label, count in zip(unique, counts)}
     return distribution
 
-def simulate_label_removal(df, remove_percentage):
-    """
-    Simulate removing x% of samples where label = 1 and return the modified dataset.
-    """
-    df_1 = df[df["follow_up"] == 1]  # Samples with label 1
-    df_0 = df[df["follow_up"] == 0]  # Samples with label 0
-
-    num_to_remove = int(len(df_1) * (remove_percentage / 100.0))
-    df_1_remaining = df_1.sample(n=len(df_1) - num_to_remove, random_state=42)
-
-    df_modified = pd.concat([df_0, df_1_remaining]).sample(frac=1, random_state=42).reset_index(drop=True)
-    return df_modified
-
 class BaselineModel:
     """Baseline model that predicts follow-up probability based only on the overall ratio of follow-ups."""
     
@@ -66,22 +53,22 @@ class BaselineModel2:
 
     def train(self):
         """Train the baseline by computing the probability of continuation and count for different conversation lengths."""
-        # Group by 'num_pairs' and calculate the mean and count of 'follow_up'
-        group_stats = self.df.groupby("num_pairs")["follow_up"].agg(['mean', 'size']).reset_index()
-        group_stats.columns = ['num_pairs', 'follow_up_probability', 'count']
+        # Group by 'turns' and calculate the mean and count of 'follow_up'
+        group_stats = self.df.groupby("turns")["follow_up"].agg(['mean', 'size']).reset_index()
+        group_stats.columns = ['turns', 'follow_up_probability', 'count']
 
         # Convert the DataFrame to a dictionary for easy access
-        self.probability_table = group_stats.set_index('num_pairs')['follow_up_probability'].to_dict()
+        self.probability_table = group_stats.set_index('turns')['follow_up_probability'].to_dict()
 
         # Print the probability distribution with counts
         print("\n=== Follow-Up Probability Distribution ===")
         for _, row in group_stats.iterrows():
-            print(f"Rounds: {row['num_pairs']}, Count: {row['count']}, Follow-Up Probability: {row['follow_up_probability']:.4f}")
+            print(f"Rounds: {row['turns']}, Count: {row['count']}, Follow-Up Probability: {row['follow_up_probability']:.4f}")
 
 
-    def predict(self, num_pairs):
+    def predict(self, turns):
         """Predict whether the conversation will continue based on probability."""
-        probability = self.probability_table.get(num_pairs, 0.5)  # Default to 50% if unseen num_pairs
+        probability = self.probability_table.get(turns, 0.5)  # Default to 50% if unseen turns
         return 1 if probability >= 0.5 else 0
 
 
@@ -124,10 +111,9 @@ class MLPClassifier(nn.Module):
 class FollowUpPredictor:
     """ML-based model using Sentence Transformers and a multi-layer MLP classifier."""
     
-    def __init__(self, df, model_name="sentence-transformers/all-MiniLM-L6-v2", hidden_dim=128, num_layers=3, dropout=0.3):
+    def __init__(self, df, bert_model_name, hidden_dim=128, num_layers=3, dropout=0.3):
         self.df = df
-        self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
+        self.bert = SentenceTransformer(bert_model_name)
         self.train_dataloader = None
         self.test_dataloader = None
         self.train_data = None
@@ -136,7 +122,7 @@ class FollowUpPredictor:
         self.num_layers = num_layers
         self.dropout = dropout
 
-    def prepare_data(self, test_size=0.2):
+    def prepare_data(self, test_size=0.1):
         """Prepare train-test split and convert data into required format."""
         train_data, test_data = train_test_split(
             self.df, test_size=test_size, random_state=42, stratify=self.df["follow_up"]
@@ -146,14 +132,14 @@ class FollowUpPredictor:
         self.test_data = test_data
 
         train_examples = [
-            (row["text"], row["num_pairs"], torch.tensor(row["follow_up"], dtype=torch.long)) for _, row in train_data.iterrows()
+            (row["text"], row["turns"], torch.tensor(row["follow_up"], dtype=torch.long)) for _, row in train_data.iterrows()
         ]
 
         self.train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=16)
 
-    def train(self, num_epochs=6, lr=2e-5):
+    def train(self, num_epochs=6, lr=2e-5, no_embedding=False):
         """Train using a configurable MLP classifier with CrossEntropyLoss."""
-        sentence_embedding_dimension = self.model.get_sentence_embedding_dimension()
+        sentence_embedding_dimension = self.bert.get_sentence_embedding_dimension()
 
         # Initialize the MLP classifier
         self.classifier = MLPClassifier(
@@ -161,13 +147,14 @@ class FollowUpPredictor:
             hidden_dim=self.hidden_dim,
             num_layers=self.num_layers,
             dropout=self.dropout
-        ).to(self.model.device)
+        ).to(self.bert.device)
+        print(self.bert.device)
 
         # Define loss and optimizer
         criterion = nn.CrossEntropyLoss()
         optimizer = Adam(self.classifier.parameters(), lr=lr)
 
-        self.model.train()
+        self.classifier.train()
         best_test_accuracy = 0.0
 
         for epoch in range(num_epochs):
@@ -178,13 +165,13 @@ class FollowUpPredictor:
                 input_texts, input_vals, labels = batch  # Unpack tuple
 
                 input_texts = [str(text) for text in input_texts]
-                labels = torch.tensor(labels, dtype=torch.long).to(self.model.device)
+                labels = torch.tensor(labels, dtype=torch.long).to(self.bert.device)
 
                 # Encode sentences into embeddings
-                embeddings = self.model.encode(input_texts, convert_to_tensor=True, batch_size=len(input_texts))
-                embeddings *= 0
+                embeddings = self.bert.encode(input_texts, convert_to_tensor=True, batch_size=len(input_texts))
+                embeddings *= 0 if no_embedding else 1
 
-                input_vals = torch.tensor(input_vals, dtype=torch.float).to(self.model.device)
+                input_vals = torch.tensor(input_vals, dtype=torch.float).to(self.bert.device)
                 if input_vals.dim() == 1:
                     input_vals = input_vals.unsqueeze(1)  # Expand dims if needed
 
@@ -205,7 +192,7 @@ class FollowUpPredictor:
                 total_loss += loss.item()
 
                 # Print progress every 100 batches
-                if batch_idx % 100 == 0:
+                if batch_idx % 5000 == 0:
                     elapsed_time = time.time() - start_time
                     estimated_time = (elapsed_time / (batch_idx + 1)) * (len(self.train_dataloader) - batch_idx - 1)
                     print(f"Epoch {epoch+1} [{batch_idx}/{len(self.train_dataloader)}]: "
@@ -213,17 +200,18 @@ class FollowUpPredictor:
                           f"Estimated Time Remaining: {estimated_time:.2f}s")
 
             print(f"Epoch {epoch+1} completed. Average Loss: {total_loss / len(self.train_dataloader):.4f}")
-            y_pred_classifier = predictor.predict(self.test_data)
+            self.save_model('', epoch+1)
+            y_pred_classifier = self.predict(self.test_data)
             y_true = self.test_data["follow_up"].tolist()
             classifier_precision, classifier_recall, classifier_f1 = calculate_metrics(y_true, y_pred_classifier)
             print(f"\nClassifier Model Metrics:")
             print(f"Precision: {classifier_precision:.4f}, Recall: {classifier_recall:.4f}, F1-score: {classifier_f1}")
 
 
-    def predict(self, test_data):
+    def predict(self, test_data, no_embedding=False):
         """Compute accuracy for the given dataloader."""
         test_examples = [
-            (row["text"], row["num_pairs"], torch.tensor(row["follow_up"], dtype=torch.long)) for _, row in test_data.iterrows()
+            (row["text"], row["turns"], torch.tensor(row["follow_up"], dtype=torch.long)) for _, row in test_data.iterrows()
         ]
         test_dataloader = DataLoader(test_examples, shuffle=False, batch_size=512)
         y_true = []
@@ -237,9 +225,9 @@ class FollowUpPredictor:
             labels = labels.clone().detach().cpu().numpy()
 
             # Encode and predict
-            embeddings = self.model.encode(input_texts, convert_to_tensor=True, batch_size=len(input_texts))
-            embeddings *= 0
-            input_vals = input_vals.clone().detach().to(self.model.device)
+            embeddings = self.bert.encode(input_texts, convert_to_tensor=True, batch_size=len(input_texts))
+            embeddings *= 0 if no_embedding else 1
+            input_vals = input_vals.clone().detach().to(self.bert.device)
             if input_vals.dim() == 1:
                 input_vals = input_vals.unsqueeze(1)  # Expand dims if needed
 
@@ -252,15 +240,15 @@ class FollowUpPredictor:
             y_pred.extend(predictions)
         return y_pred
 
-    def save_model(self, save_path):
+    def save_model(self, save_path, epoch):
         """Save the trained model and classifier."""
-        self.model.save(save_path)
-        classifier_path = f"{save_path}/classifier.pt"
+        # self.classifier.save(save_path)
+        classifier_path = f"{save_path}classifier{epoch}.pt"
         torch.save(self.classifier.state_dict(), classifier_path)
         print(f"Classifier saved to {classifier_path}!")
 
 
-def load_conv_data(data_source):
+def load_conv_data(data_source, N, format):
     """Load and preprocess conversation data from either a JSON file or Hugging Face dataset."""
     
     conversation_features = []
@@ -277,7 +265,7 @@ def load_conv_data(data_source):
     else:
         raise ValueError("Invalid data source! Must be a JSON file path or Hugging Face dataset.")
 
-    for convo in data[:100000]:
+    for convo in data[:N]:
         messages = convo.get("conversation", [])
         role = "role"
         user = "user"
@@ -289,22 +277,23 @@ def load_conv_data(data_source):
             user = "human"
             content = "value"
             messages = convo.get("conversations", [])
-        num_pairs = 0  # Initialize num_pairs at the start of each conversation
+        turns = 0  # Initialize turns at the start of each conversation
 
         for i in range(len(messages) - 1):
             if messages[i][role] == user and messages[i + 1][role] in ("assistant", "gpt"):
                 user_message = messages[i][content]
                 assistant_response = messages[i + 1][content]
-                combined_text = f"User: {user_message} Assistant: {assistant_response}"
+                combined_text = f"{user_message}" # Assistant: {assistant_response}"
+                # todo: more user messages
                 follow_up = 1 if (i + 2 < len(messages) and messages[i + 2][role] == user) else 0
 
                 conversation_features.append({
                     "text": combined_text,
                     "follow_up": follow_up,
-                    "num_pairs": num_pairs  # Ensure num_pairs is correctly stored
+                    "turns": turns  # Ensure turns is correctly stored
                 })
 
-                num_pairs += 1  # Increment for the next pair
+                turns += 1  # Increment for the next pair
 
     df = pd.DataFrame(conversation_features)
 
@@ -314,25 +303,28 @@ def load_conv_data(data_source):
     return df
 
 
+bert_model_name="sentence-transformers/all-MiniLM-L6-v2"
+hidden_dim=128
+num_layers=6
 
 # ==== RUN MODEL ====
 if __name__ == "__main__":
-    dataset_choice = "lmsys-chat-1m"
-    json_file = "../ShareGPT_V3_unfiltered_cleaned_split.json" if dataset_choice == "sharegpt" else None
+    dataset_choice = "sharegpt" # "lmsys-chat-1m"
+    json_file = "../../ShareGPT_V3_unfiltered_cleaned_split.json" if dataset_choice == "sharegpt" else None
 
     if dataset_choice == "lmsys-chat-1m":
         print("Loading dataset: LMSys-chat-1M from Hugging Face...")
         ds = load_dataset("lmsys/lmsys-chat-1m")  # Use authentication if required
-        df = load_conv_data(ds)
+        df = load_conv_data(ds, 100000, 'lmsys')
         print("\n=== Sample Data from Processed Dataset ===")
         print(df.head())
     elif dataset_choice == "sharegpt":
         print(f"Loading dataset: ShareGPT from {json_file}...")
-        df = load_conv_data(json_file)
+        df = load_conv_data(json_file, 100000, 'sharegpt')
     elif dataset_choice == "chatbot_arena":
         print("Loading dataset: Chatbot Arena Conversations from Hugging Face...")
         ds = load_dataset("lmsys/chatbot_arena_conversations")
-        df = load_conv_data(ds)
+        df = load_conv_data(ds, 100000, 'chatbot_arena')
     else:
         raise ValueError("Invalid dataset choice! Choose between 'lmsys-chat-1m' and 'sharegpt'.")
 
@@ -344,16 +336,15 @@ if __name__ == "__main__":
     baseline2.train()
 
     # Initialize and train model
-    predictor = FollowUpPredictor(df, hidden_dim=256, num_layers=6, dropout=0.25)
+    predictor = FollowUpPredictor(df, bert_model_name, hidden_dim=hidden_dim, num_layers=num_layers, dropout=0.)
     predictor.prepare_data()
-    predictor.train(num_epochs=3, lr=5e-5)
-    predictor.save_model(dataset_choice)
+    predictor.train(num_epochs=6, lr=5e-5)
 
     test_df = predictor.test_data
     y_true = test_df["follow_up"].tolist()
     # Get predictions from the baseline model
     y_pred_baseline = baseline.predict(len(y_true))
-    y_pred_baseline2 = [baseline2.predict(num_pairs) for num_pairs in test_df["num_pairs"]]
+    y_pred_baseline2 = [baseline2.predict(turns) for turns in test_df["turns"]]
     y_pred_classifier = predictor.predict(test_df)
 
     # Compute metrics for Baseline Model
@@ -371,3 +362,33 @@ if __name__ == "__main__":
     # Calculate and print label distribution for the classifier
     # classifier_distribution = calculate_label_distribution(y_pred_classifier)
     # print("Classifier Prediction Distribution:", classifier_distribution)
+else:
+    class Predictor:
+        def __init__(self, model_path, bert_model):
+            self.bert = bert_model
+            self.device = self.bert.device
+            self.classifier = MLPClassifier(
+                input_dim=self.bert.get_sentence_embedding_dimension() + 1,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                dropout=0.
+            ).to(self.device)
+            self.classifier.load_state_dict(torch.load(model_path, map_location=self.device))
+            self.classifier.eval()
+
+        def predict_proba(self, text, turns):
+            embeddings = self.bert.encode([text], convert_to_tensor=True, batch_size=1)
+            embeddings *= 0  # Adjust if embedding is not used (based on your previous code)
+
+            input_vals = torch.tensor([[turns]], dtype=torch.float).to(self.device)
+            combined_features = torch.cat((embeddings, input_vals), dim=1)
+
+            with torch.no_grad():
+                logits = self.classifier(combined_features)
+                probabilities = torch.softmax(logits, dim=1)
+
+            prob_has_next = probabilities[0][1].item()  # probability for "having next turn"
+            return prob_has_next
+
+    # Global predictor instance
+    predictor_instance = Predictor('/data/dongshengy/vllm/benchmarks/classifier6.pt', SentenceTransformer(bert_model_name))

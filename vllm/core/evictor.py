@@ -64,7 +64,7 @@ class CacheStat:
         self.stat = defaultdict(list)
         self.average = {}
         self.last_log_time = 0
-        self.log_interval = 5  # Log every 5 seconds
+        self.log_interval = 10000  # Log every 5 seconds
     
     def get_average(self, key):
         if key in self.average:
@@ -120,7 +120,7 @@ class LRUMLEvictor(Evictor):
         self.sorted_dict = SortedDict()
         self.config = self.parse_str_to_dict(config)
         self.stat = CacheStat()
-        self.last_clean_time = time.time()
+        self.last_refresh_time = time.time()
         self.INSPECT_INTERVAL = 10
 
     def __contains__(self, block_id: int) -> bool:
@@ -134,10 +134,9 @@ class LRUMLEvictor(Evictor):
     def probability_of_future_arrival(self, prob_has_next, exp_scale, elapsed_time, future_window):
         if prob_has_next == 0:
             return 0.0
-        prob_survived_elapsed = np.exp(-elapsed_time / exp_scale)
-        prob_not_survive_future = 1 - np.exp(-future_window / exp_scale)
-        return (prob_has_next * prob_survived_elapsed * prob_not_survive_future) / (
-                prob_has_next * prob_survived_elapsed + (1 - prob_has_next)
+        prob_not_accessed_till_now = np.exp(-elapsed_time / exp_scale)
+        return (prob_has_next * prob_not_accessed_till_now) / (
+                prob_has_next * prob_not_accessed_till_now + (1 - prob_has_next)
         )
 
     def calc_score(self, last_accessed, cache_hint):
@@ -146,26 +145,11 @@ class LRUMLEvictor(Evictor):
         if 'prob_has_next' in cache_hint:
             return self.probability_of_future_arrival(
                 cache_hint['prob_has_next'], cache_hint['exp_scale'],
-                time.time() - last_accessed, 10)
-        if cache_hint['turns'] <= 6:
-            return 6 - cache_hint['turns'] + last_accessed
-        else:
-            return max(cache_hint['turns'] - 6, 10) + last_accessed
+                time.time() - last_accessed, self.INSPECT_INTERVAL)
 
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
             raise ValueError("No usable cache memory left")
-        if time.time() - self.last_clean_time > self.INSPECT_INTERVAL:
-            self.last_clean_time = time.time()
-            stat_ = CacheStat()
-            print('Sampled blocks in the cache:')
-            for block_id in self.free_table:
-                survival_time = time.time() - self.free_table[block_id].last_accessed
-                stat_.append("survival_times", survival_time)
-                if block_id % 500 == 0:
-                    print(self.free_table[block_id].cache_hint, self.free_table[block_id].score, self.free_table[block_id].last_accessed)
-            print('For all blocks in the cache:')
-            stat_.summary()
 
         _, (block_id, content_hash) = self.sorted_dict.popitem(0)  # Remove smallest score
         if block_id in self.free_table:
@@ -174,9 +158,8 @@ class LRUMLEvictor(Evictor):
             del self.free_table[block_id]
             return block_id, content_hash
         else:
-            print('block is not in the sorted dict')
-
-        raise ValueError("No usable cache memory left")
+            # print('block is not in the sorted_dict')
+            raise ValueError("block is not in the sorted_dict")
 
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
@@ -187,6 +170,18 @@ class LRUMLEvictor(Evictor):
                                                   cache_hint,
                                                   score)
         self.sorted_dict[(score, block_id)] = (block_id, content_hash)
+        if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:
+            self._refresh()
+            self.last_refresh_time = time.time()
+            stat_ = CacheStat()
+            print('Sampled blocks in the cache:')
+            for block_id in self.free_table:
+                survival_time = time.time() - self.free_table[block_id].last_accessed
+                stat_.append("survival_times", survival_time)
+                if block_id % 500 == 0:
+                    print(self.free_table[block_id].cache_hint, self.free_table[block_id].score, self.free_table[block_id].last_accessed)
+            print('For all blocks in the cache:')
+            stat_.summary()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
         if block_id in self.free_table:
@@ -194,6 +189,8 @@ class LRUMLEvictor(Evictor):
             old_entry = (old_score, block_id)
             if old_entry in self.sorted_dict:
                 del self.sorted_dict[old_entry]
+            else:
+                raise ValueError("the score is not found in sorted_dict")
         
         score = self.calc_score(last_accessed, cache_hint)
         self.free_table[block_id].last_accessed = last_accessed
@@ -210,11 +207,23 @@ class LRUMLEvictor(Evictor):
         old_entry = (old_score, block_id)
         if old_entry in self.sorted_dict:
             del self.sorted_dict[old_entry]
+        else:
+            raise ValueError("the score is not found in sorted_dict")
         del self.free_table[block_id]
 
     @property
     def num_blocks(self) -> int:
         return len(self.free_table)
+
+    def _refresh(self):
+        new_sorted_dict = SortedDict()
+
+        for block_id, block in self.free_table.items():
+            score = self.calc_score(block.last_accessed, block.cache_hint)
+            block.score = score
+            new_sorted_dict[(score, block_id)] = (block_id, block.content_hash)
+
+        self.sorted_dict = new_sorted_dict
 
 class LRUEvictor(Evictor):
     """Evicts in a least-recently-used order using the last_accessed timestamp
@@ -303,9 +312,9 @@ class LRUEvictor(Evictor):
 def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
     if eviction_algorithm == 'lru':
         return LRUEvictor()
-    elif eviction_algorithm == 'lru-ml':
+    elif eviction_algorithm.startswith('lru-ml'):
         return LRUMLEvictor(config)
-    elif eviction_algorithm == 'lruml':
+    elif eviction_algorithm.startswith('lruml'):
         return LRUMLEvictor(config)
     else:
         raise ValueError(f"Unknown cache eviction policy: {eviction_algorithm}")

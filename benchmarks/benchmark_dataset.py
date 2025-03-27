@@ -345,6 +345,7 @@ class ShareGPTDataset(BenchmarkDataset):
                output_len: Optional[int] = None,
                conv_scale: float = 0.25,
                req_scale: float = 10,
+               human_delay: float = 5,
                **kwargs) -> list:
         samples: list = []
         conv_timestamp = 0
@@ -385,7 +386,7 @@ class ShareGPTDataset(BenchmarkDataset):
                         turn_id=turn*2,
                         timestamp=req_timestamp,
                     ))
-                req_timestamp += np.random.exponential(req_scale)
+                req_timestamp += np.random.exponential(req_scale) + human_delay
                 if (turn+1) * 2 + 1 < len(entry["conversations"]):
                     samples[-1].next_timestamp = req_timestamp
             self.conversation_id += 1

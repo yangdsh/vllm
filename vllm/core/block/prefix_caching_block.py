@@ -1128,8 +1128,7 @@ class LastAccessBlocksTracker:
         """
         assert seq_id in self._seq_last_access
         del self._seq_last_access[seq_id]
-        #if self._seq_cache_hint[seq_id]['id'] in [86, 385, 800]:
-        #    print('remove: ', seq_id, self._seq_cache_hint[seq_id])
+        # print('remove: ', seq_id, self._seq_cache_hint[seq_id])
         del self._seq_cache_hint[seq_id]
 
     def update_last_access(self, seq_id: int, time: float) -> None:
@@ -1137,8 +1136,6 @@ class LastAccessBlocksTracker:
         self._seq_last_access[seq_id] = time
 
     def update_cache_hint(self, seq_id: int, cache_hint: dict) -> None:    
-        #if cache_hint['id'] in [86, 385, 800]:
-        #    print('update: ', seq_id, cache_hint)
         if seq_id not in self._seq_cache_hint[seq_id]:
             self._seq_cache_hint[seq_id] = cache_hint
         else:
@@ -1152,10 +1149,11 @@ class LastAccessBlocksTracker:
         ts = self._seq_last_access[seq_id]
         cache_hint = self._seq_cache_hint[seq_id]
 
+        # print('mark blocks? ', seq_id, cache_hint)
         if ts is None:
             # No last access was recorded, no need to update.
             return
-
+        # print('mark blocks: ', seq_id, cache_hint)
         self._allocator.mark_blocks_as_accessed(block_ids, ts, cache_hint)
 
 

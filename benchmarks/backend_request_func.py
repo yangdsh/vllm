@@ -19,6 +19,8 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 
 from vllm.model_executor.model_loader.weight_utils import get_lock
 
+from learn_conversation import predictor_instance
+
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
@@ -376,11 +378,14 @@ async def async_request_openai_chat_completions(
     
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
-        return {"turns": len(conversation_history[conversation_id]) // 2,
-                "prob_has_next": (request_func_input.next_timestamp < 1e8) * 0.9,
+        turns = len(conversation_history[conversation_id]) // 2
+        prob_has_next = predictor_instance.predict_proba(request_func_input.prompt, turns)
+        # prob_has_next = (request_func_input.next_timestamp < 1e8) * 0.9
+        return {"turns": turns,
+                "prob_has_next": prob_has_next,
                 "exp_scale": request_func_input.exp_scale,
                 "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
-                "id": conversation_id
+                "id": conversation_id,
                 # "next_timestamp": request_func_input.next_timestamp
                 }
     
@@ -481,7 +486,7 @@ async def async_request_openai_chat_completions(
         n_running_req -= 1
         n_completed_req += 1
         if n_completed_req % 100 == 0:
-            metrics_url = f"{request_func_input.api_url.replace("v1/chat/completions", "")}metrics"
+            metrics_url = f"{request_func_input.api_url.replace('v1/chat/completions', '')}metrics"
             response = requests.get(metrics_url)
             for line in response.text.split("\n"):
                 if "gpu_prefix_cache_hit_rate{" in line:

@@ -595,8 +595,7 @@ class LLMEngine:
             decoder_inputs = processed_inputs
             encoder_inputs = None
 
-        #if cache_hint['id'] in [86, 385, 800]:
-        #    print('create: ', cache_hint)
+        # print('create: ', seq_id, cache_hint)
         seq = Sequence(seq_id, decoder_inputs, block_size, eos_token_id,
                        lora_request, prompt_adapter_request, cache_hint)
 
