@@ -327,12 +327,20 @@ class ShareGPTDataset(BenchmarkDataset):
         if self.dataset_path is None:
             raise ValueError("dataset_path must be provided for loading data.")
 
-        with open(self.dataset_path, encoding="utf-8") as f:
-            self.data = json.load(f)
+        if '.json' in self.dataset_path:
+            with open(self.dataset_path, encoding="utf-8") as f:
+                self.data = json.load(f)
+            self.conv_tag = 'conversations'
+            self.value_tag = 'value'
+        else:
+            ds = load_dataset(self.dataset_path)
+            self.data = ds["train"].to_pandas().to_dict(orient="records")
+            self.conv_tag = 'conversation'
+            self.value_tag = 'content'
         # Filter entries with at least two conversation turns.
         self.data = [
             entry for entry in self.data
-            if "conversations" in entry and len(entry["conversations"]) >= 2
+            if self.conv_tag in entry and len(entry[self.conv_tag]) >= 2
         ]
         random.seed(self.random_seed)
         random.shuffle(self.data)
@@ -350,17 +358,19 @@ class ShareGPTDataset(BenchmarkDataset):
         samples: list = []
         conv_timestamp = 0
         for entry in self.data:
-            #if len(entry["conversations"])//2 != 1:
+            #if len(entry[self.conv_tag])//2 != 1:
             #    continue
             conv_timestamp += np.random.exponential(conv_scale)
             req_timestamp = conv_timestamp
-            for turn in range(len(entry["conversations"])//2):
+            for turn in range(len(entry[self.conv_tag])//2):
                 if len(samples) >= num_requests:
                     break
-                if turn * 2 + 1 >= len(entry["conversations"]):
+                if turn * 2 + 1 >= len(entry[self.conv_tag]):
                     break
-                prompt, completion = entry["conversations"][turn * 2]["value"],\
-                    entry["conversations"][turn * 2 + 1]["value"]
+                #if turn >= 1: # MAX_TURNS=16
+                #    break
+                prompt, completion = entry[self.conv_tag][turn * 2][self.value_tag],\
+                    entry[self.conv_tag][turn * 2 + 1][self.value_tag]
 
                 lora_request, tokenizer = self.get_random_lora_request(
                     tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
@@ -369,7 +379,7 @@ class ShareGPTDataset(BenchmarkDataset):
                 prompt_len = len(prompt_ids)
                 new_output_len = (len(completion_ids)
                                 if output_len is None else output_len)
-                #if turn == len(entry["conversations"])//2 - 1:
+                #if turn == len(entry[self.conv_tag])//2 - 1:
                 #    new_output_len = 1
                 #if not is_valid_sequence(prompt_len,
                 #                        new_output_len,
@@ -386,8 +396,12 @@ class ShareGPTDataset(BenchmarkDataset):
                         turn_id=turn*2,
                         timestamp=req_timestamp,
                     ))
-                req_timestamp += np.random.exponential(req_scale) + human_delay
-                if (turn+1) * 2 + 1 < len(entry["conversations"]):
+                if "timestamp" not in entry[self.conv_tag][turn * 2]:
+                    req_timestamp += np.random.exponential(req_scale) + human_delay
+                else:
+                    if (turn+1) * 2 + 1 < len(entry[self.conv_tag]):
+                        req_timestamp = conv_timestamp + entry[self.conv_tag][(turn+1) * 2]["timestamp"] * req_scale
+                if (turn+1) * 2 + 1 < len(entry[self.conv_tag]):
                     samples[-1].next_timestamp = req_timestamp
             self.conversation_id += 1
         # random.shuffle(samples) # todo

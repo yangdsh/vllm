@@ -2,6 +2,7 @@
 
 import json
 import os
+import random
 import sys
 import time
 import traceback
@@ -19,7 +20,7 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 
 from vllm.model_executor.model_loader.weight_utils import get_lock
 
-from learn_conversation import predictor_instance
+from learn_conversation import make_predictor
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -43,6 +44,9 @@ class RequestFuncInput:
     turn_id: int = -1
     predicted_latency: float = 0
     exp_scale: float = 1
+    checkpoint: str = ''
+    use_oracle: float = 0
+    use_fifo: int = 0
 
 
 @dataclass
@@ -345,6 +349,7 @@ conversation_history = defaultdict(list)
 start_time = 0
 n_completed_req = 0
 n_running_req = 0
+predictor_instance = None
 
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
@@ -353,14 +358,20 @@ async def async_request_openai_chat_completions(
     global n_running_req
     global n_completed_req
     global start_time
+    global predictor_instance
+    if not predictor_instance and request_func_input.checkpoint:
+        predictor_instance = make_predictor(request_func_input.checkpoint)
     api_url = request_func_input.api_url
     assert api_url.endswith(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
+    # wait until all previous turns are finished
     while len(conversation_history[request_func_input.conversation_id]) != request_func_input.turn_id \
             and request_func_input.turn_id >= 0:
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(1)
+        print("waiting for ", request_func_input.conversation_id)
+
     if request_func_input.conversation_id == 0 and request_func_input.turn_id == 0:
         start_time = time.time()
 
@@ -371,7 +382,7 @@ async def async_request_openai_chat_completions(
             content.append(request_func_input.multi_modal_content)
         user_message = {
                 "role": "user",
-                "content": content
+                "content": request_func_input.prompt
             }
         conversation_history[conversation_id].append(user_message)
         return conversation_history[conversation_id]
@@ -379,15 +390,33 @@ async def async_request_openai_chat_completions(
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
         turns = len(conversation_history[conversation_id]) // 2
-        prob_has_next = predictor_instance.predict_proba(request_func_input.prompt, turns)
-        # prob_has_next = (request_func_input.next_timestamp < 1e8) * 0.9
-        return {"turns": turns,
+        if predictor_instance:
+            prob_has_next = predictor_instance.predict_prob(conversation_history[conversation_id], turns)
+            # print(prob_has_next, request_func_input.next_timestamp)
+        else:
+            prob_has_next = 1
+        # oracle
+        if request_func_input.use_oracle > 0:
+            prob_has_next = (request_func_input.next_timestamp < 1e8)
+            # with probablity 1 - request_func_input.use_oracle, flip
+            error_rate = (1-request_func_input.use_oracle)
+            uncertainty = (1-request_func_input.use_oracle)
+            if random.random() < error_rate:
+                prob_has_next = (1 - prob_has_next) * (1- uncertainty * 2) + uncertainty
+            else:
+                prob_has_next = prob_has_next * (1- uncertainty * 2) + uncertainty
+
+        hint = {"turns": turns,
                 "prob_has_next": prob_has_next,
                 "exp_scale": request_func_input.exp_scale,
                 "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
                 "id": conversation_id,
-                # "next_timestamp": request_func_input.next_timestamp
                 }
+        if request_func_input.use_fifo > 0:
+            hint['use_fifo'] = 1
+        if request_func_input.use_oracle == 2:
+            hint["next_timestamp"] = request_func_input.next_timestamp
+        return hint
     
     def update_conversation(conversation_id, generated_text):
         conversation_history[conversation_id].append(
@@ -476,6 +505,7 @@ async def async_request_openai_chat_completions(
                     output.error = response.reason or ""
                     output.success = False
                     error_text = await response.text()
+                    update_conversation(request_func_input.conversation_id, "Error")
                     print("Response status:", response.status)
                     print("Response headers:", response.headers)
                     print("Response body:", error_text)

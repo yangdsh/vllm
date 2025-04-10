@@ -261,6 +261,7 @@ async def benchmark(
     input_requests: list[SampleRequest],
     logprobs: Optional[int],
     request_rate: float,
+    session_rate: float,
     burstiness: float,
     disable_tqdm: bool,
     profile: bool,
@@ -339,6 +340,7 @@ async def benchmark(
         distribution = "Gamma distribution"
 
     print(f"Traffic request rate: {request_rate}")
+    print(f"Traffic session rate: {session_rate}")
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
@@ -367,6 +369,7 @@ async def benchmark(
             request.prompt_len, request.expected_output_len, \
                 request.multi_modal_data, request.conversation_id, request.turn_id
         if last_conversation_id > 0 and conversation_id == last_conversation_id:
+            print(last_conversation_id, conversation_id)
             # skip cool down
             break
         req_model_id, req_model_name = model_id, model_name
@@ -387,7 +390,10 @@ async def benchmark(
                                               turn_id=turn_id,
                                               timestamp=request.timestamp,
                                               next_timestamp=request.next_timestamp,
-                                              exp_scale=1/args.request_rate)
+                                              exp_scale=1/args.request_rate,
+                                              checkpoint=args.checkpoint,
+                                              use_oracle=args.use_oracle,
+                                              use_fifo=args.use_fifo)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -635,12 +641,13 @@ def main(args: argparse.Namespace):
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
-            "sharegpt":
+            "conversation":
             lambda: ShareGPTDataset(random_seed=args.seed,
                                     dataset_path=args.dataset_path).sample(
                                         tokenizer=tokenizer,
                                         num_requests=args.num_prompts,
                                         output_len=args.sharegpt_output_len,
+                                        conv_scale=1/args.session_rate,
                                         req_scale=1/args.request_rate
                                     ),
             "burstgpt":
@@ -678,6 +685,7 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             input_requests=input_requests,
             logprobs=args.logprobs,
+            session_rate=args.session_rate,
             request_rate=args.request_rate,
             burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
@@ -718,6 +726,7 @@ def main(args: argparse.Namespace):
         # Traffic
         result_json["request_rate"] = (args.request_rate if args.request_rate
                                        < float("inf") else "inf")
+        result_json["session_rate"] = args.session_rate
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
 
@@ -765,9 +774,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset-name",
         type=str,
-        default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        default="conversation",
+        choices=["conversation", "burstgpt", "sonnet", "random", "hf"],
         help="Name of the dataset to benchmark on.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="",
+        help="path to the checkpoint of the cache hint model",
+    )
+    parser.add_argument(
+        "--use-oracle",
+        type=float,
+        default=0,
+        help= "future info is used in the cache hint, 1: has_next_turn; 2: tta",
+    )
+    parser.add_argument(
+        "--use-fifo",
+        type=int,
+        default=0,
     )
     parser.add_argument("--dataset-path",
                         type=str,
@@ -825,6 +851,11 @@ if __name__ == "__main__":
         "Otherwise, we use Poisson process or gamma distribution "
         "to synthesize the request arrival times."
         "For ShareGPT dataset, this is the request rate within each conversation",
+    )
+    parser.add_argument(
+        "--session-rate",
+        type=float,
+        default=float("inf"),
     )
     parser.add_argument(
         "--burstiness",

@@ -169,24 +169,34 @@ class LRUMLEvictor(Evictor):
                                                   last_accessed,
                                                   cache_hint,
                                                   score)
-        self.sorted_dict[(score, block_id)] = (block_id, content_hash)
+        self.sorted_dict[(score, last_accessed, block_id)] = (block_id, content_hash)
         if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:
             self._refresh()
             self.last_refresh_time = time.time()
             stat_ = CacheStat()
-            print('Sampled blocks in the cache:')
+            print('Top 10 blocks with oldest last_accessed time:')
+            # Create a list of (block_id, survival_time) tuples
+            survival_list = [
+                (block_id, self.free_table[block_id].last_accessed)
+                for block_id in self.free_table
+            ]
+            # Sort by survival_time in descending order
+            survival_list.sort(key=lambda x: x[1])
+            # Print top 10
+            for block_id, survival_time in survival_list[:10]:
+                block = self.free_table[block_id]
+                print(block.cache_hint, block.score, block.last_accessed)
+
             for block_id in self.free_table:
                 survival_time = time.time() - self.free_table[block_id].last_accessed
                 stat_.append("survival_times", survival_time)
-                if block_id % 500 == 0:
-                    print(self.free_table[block_id].cache_hint, self.free_table[block_id].score, self.free_table[block_id].last_accessed)
             print('For all blocks in the cache:')
             stat_.summary()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
         if block_id in self.free_table:
             old_score = self.free_table[block_id].score
-            old_entry = (old_score, block_id)
+            old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
             if old_entry in self.sorted_dict:
                 del self.sorted_dict[old_entry]
             else:
@@ -197,14 +207,14 @@ class LRUMLEvictor(Evictor):
         self.free_table[block_id].cache_hint = cache_hint
         self.free_table[block_id].score = score
         
-        self.sorted_dict[(score, block_id)] = (block_id, self.free_table[block_id].content_hash)
+        self.sorted_dict[(score, last_accessed, block_id)] = (block_id, self.free_table[block_id].content_hash)
 
     def remove(self, block_id: int):
         if block_id not in self.free_table:
             raise ValueError("Attempting to remove block that's not in the evictor")
         
         old_score = self.free_table[block_id].score
-        old_entry = (old_score, block_id)
+        old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
         if old_entry in self.sorted_dict:
             del self.sorted_dict[old_entry]
         else:
@@ -221,7 +231,7 @@ class LRUMLEvictor(Evictor):
         for block_id, block in self.free_table.items():
             score = self.calc_score(block.last_accessed, block.cache_hint)
             block.score = score
-            new_sorted_dict[(score, block_id)] = (block_id, block.content_hash)
+            new_sorted_dict[(score, block.last_accessed, block_id)] = (block_id, block.content_hash)
 
         self.sorted_dict = new_sorted_dict
 
@@ -279,7 +289,8 @@ class LRUEvictor(Evictor):
         self._cleanup_if_necessary()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
-        self.free_table[block_id].last_accessed = last_accessed
+        if 'use_fifo' not in cache_hint or cache_hint['use_fifo'] == 0:
+            self.free_table[block_id].last_accessed = last_accessed
         self.free_table[block_id].cache_hint = cache_hint
 
     def _cleanup_if_necessary(self):
@@ -314,7 +325,7 @@ def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
         return LRUEvictor()
     elif eviction_algorithm.startswith('lru-ml'):
         return LRUMLEvictor(config)
-    elif eviction_algorithm.startswith('lruml'):
+    elif eviction_algorithm.startswith('ml'):
         return LRUMLEvictor(config)
     else:
         raise ValueError(f"Unknown cache eviction policy: {eviction_algorithm}")
