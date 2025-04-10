@@ -345,12 +345,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         block_id, content_hash_to_evict = self.evictor.evict()
 
         # Sanity checks
-        assert content_hash_to_evict in self._cached_blocks
-        _block_id = self._cached_blocks[content_hash_to_evict]
-        assert self._refcounter.get(_block_id) == 0
-        assert _block_id == block_id
+        if content_hash_to_evict in self._cached_blocks:
+            _block_id = self._cached_blocks[content_hash_to_evict]
+            assert self._refcounter.get(_block_id) == 0
+            assert _block_id == block_id
 
-        self._cached_blocks.pop(content_hash_to_evict)
+            self._cached_blocks.pop(content_hash_to_evict)
 
         self._refcounter.incr(block_id)
         self._track_block_id(block_id, computed=False)

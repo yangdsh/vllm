@@ -347,6 +347,7 @@ async def async_request_openai_completions(
 
 conversation_history = defaultdict(list)
 start_time = 0
+n_follow_up = 0
 n_completed_req = 0
 n_running_req = 0
 predictor_instance = None
@@ -357,6 +358,7 @@ async def async_request_openai_chat_completions(
 ) -> RequestFuncOutput:
     global n_running_req
     global n_completed_req
+    global n_follow_up
     global start_time
     global predictor_instance
     if not predictor_instance and request_func_input.checkpoint:
@@ -371,6 +373,10 @@ async def async_request_openai_chat_completions(
             and request_func_input.turn_id >= 0:
         await asyncio.sleep(1)
         print("waiting for ", request_func_input.conversation_id)
+    if request_func_input.turn_id > 1:
+        n_follow_up += 1
+        if n_follow_up % 10 == 0:
+            print("number of follow up requests: ", n_follow_up)
 
     if request_func_input.conversation_id == 0 and request_func_input.turn_id == 0:
         start_time = time.time()
@@ -398,13 +404,14 @@ async def async_request_openai_chat_completions(
         # oracle
         if request_func_input.use_oracle > 0:
             prob_has_next = (request_func_input.next_timestamp < 1e8)
-            # with probablity 1 - request_func_input.use_oracle, flip
-            error_rate = (1-request_func_input.use_oracle)
-            uncertainty = (1-request_func_input.use_oracle)
-            if random.random() < error_rate:
-                prob_has_next = (1 - prob_has_next) * (1- uncertainty * 2) + uncertainty
-            else:
-                prob_has_next = prob_has_next * (1- uncertainty * 2) + uncertainty
+            if request_func_input.use_oracle < 1:
+                # with probablity 1 - request_func_input.use_oracle, flip
+                error_rate = (1-request_func_input.use_oracle)
+                uncertainty = (1-request_func_input.use_oracle)
+                if random.random() < error_rate:
+                    prob_has_next = (1 - prob_has_next) * (1- uncertainty * 2) + uncertainty
+                else:
+                    prob_has_next = prob_has_next * (1- uncertainty * 2) + uncertainty
 
         hint = {"turns": turns,
                 "prob_has_next": prob_has_next,
@@ -416,6 +423,8 @@ async def async_request_openai_chat_completions(
             hint['use_fifo'] = 1
         if request_func_input.use_oracle == 2:
             hint["next_timestamp"] = request_func_input.next_timestamp
+        # if conversation_id == 32:
+        #     print('~', conversation_id, request_func_input.timestamp)
         return hint
     
     def update_conversation(conversation_id, generated_text):

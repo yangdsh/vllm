@@ -118,6 +118,8 @@ class LRUMLEvictor(Evictor):
     def __init__(self, config):
         self.free_table: Dict[int, BlockMetaData] = {}
         self.sorted_dict = SortedDict()
+        self.id_to_last_access = {}
+        self.to_delete_blocks = []
         self.config = self.parse_str_to_dict(config)
         self.stat = CacheStat()
         self.last_refresh_time = time.time()
@@ -150,8 +152,13 @@ class LRUMLEvictor(Evictor):
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
             raise ValueError("No usable cache memory left")
-
-        _, (block_id, content_hash) = self.sorted_dict.popitem(0)  # Remove smallest score
+        block_id = -1
+        while block_id not in self.free_table:
+            if len(self.to_delete_blocks) > 0:
+                (block_id, content_hash) = self.to_delete_blocks[-1]
+                self.to_delete_blocks = self.to_delete_blocks[:-1]
+            else:
+                _, (block_id, content_hash) = self.sorted_dict.popitem(0)
         if block_id in self.free_table:
             survival_time = time.time() - self.free_table[block_id].last_accessed
             self.stat.append("survival_times", survival_time)
@@ -160,7 +167,7 @@ class LRUMLEvictor(Evictor):
         else:
             # print('block is not in the sorted_dict')
             raise ValueError("block is not in the sorted_dict")
-
+    
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
         score = self.calc_score(last_accessed, cache_hint)
@@ -170,28 +177,9 @@ class LRUMLEvictor(Evictor):
                                                   cache_hint,
                                                   score)
         self.sorted_dict[(score, last_accessed, block_id)] = (block_id, content_hash)
+        self.id_to_last_access[cache_hint['id']] = last_accessed
         if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:
             self._refresh()
-            self.last_refresh_time = time.time()
-            stat_ = CacheStat()
-            print('Top 10 blocks with oldest last_accessed time:')
-            # Create a list of (block_id, survival_time) tuples
-            survival_list = [
-                (block_id, self.free_table[block_id].last_accessed)
-                for block_id in self.free_table
-            ]
-            # Sort by survival_time in descending order
-            survival_list.sort(key=lambda x: x[1])
-            # Print top 10
-            for block_id, survival_time in survival_list[:10]:
-                block = self.free_table[block_id]
-                print(block.cache_hint, block.score, block.last_accessed)
-
-            for block_id in self.free_table:
-                survival_time = time.time() - self.free_table[block_id].last_accessed
-                stat_.append("survival_times", survival_time)
-            print('For all blocks in the cache:')
-            stat_.summary()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
         if block_id in self.free_table:
@@ -208,6 +196,7 @@ class LRUMLEvictor(Evictor):
         self.free_table[block_id].score = score
         
         self.sorted_dict[(score, last_accessed, block_id)] = (block_id, self.free_table[block_id].content_hash)
+        self.id_to_last_access[cache_hint['id']] = last_accessed
 
     def remove(self, block_id: int):
         if block_id not in self.free_table:
@@ -234,6 +223,50 @@ class LRUMLEvictor(Evictor):
             new_sorted_dict[(score, block.last_accessed, block_id)] = (block_id, block.content_hash)
 
         self.sorted_dict = new_sorted_dict
+
+        print('num blocks: ', self.num_blocks)
+
+        self.last_refresh_time = time.time()
+        stat_ = CacheStat()
+        # Create a list of (block_id, survival_time) tuples
+        survival_list = [
+            (block_id, self.free_table[block_id].cache_hint['id'], -self.free_table[block_id].last_accessed)
+            for block_id in self.free_table
+        ]
+        # Sort by survival_time in descending order
+        survival_list.sort(key=lambda x: (x[1], x[2]))
+
+        # mark outdated blocks 
+        to_delete_cnt = 0
+        for block_id, _, _ in survival_list:
+            block = self.free_table[block_id]
+            id = block.cache_hint['id']
+            if self.id_to_last_access[id] == block.last_accessed:
+                continue
+            if self.id_to_last_access[id] != block.last_accessed:
+                self.to_delete_blocks.append((block_id, block.content_hash))
+                to_delete_cnt += 1
+        print("mark outdated blocks cnt: ", to_delete_cnt)
+
+        # Print top 10
+        cnt = 0
+        temp = 0
+        print('Top 10 blocks with oldest last_accessed time:')
+        for block_id, _, _ in survival_list:
+            block = self.free_table[block_id]
+            if block.last_accessed == temp:
+                continue
+            temp = block.last_accessed
+            cnt += 1
+            if cnt > 10:
+                break
+            print(block.cache_hint, block.score, block.last_accessed)
+
+        for block_id in self.free_table:
+            survival_time = time.time() - self.free_table[block_id].last_accessed
+            stat_.append("survival_times", survival_time)
+        print('For all blocks in the cache:')
+        stat_.summary()
 
 class LRUEvictor(Evictor):
     """Evicts in a least-recently-used order using the last_accessed timestamp
