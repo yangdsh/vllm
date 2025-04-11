@@ -121,6 +121,7 @@ class LRUMLEvictor(Evictor):
         self.id_to_last_access = {}
         self.to_delete_blocks = []
         self.config = self.parse_str_to_dict(config)
+        self.lru = 0
         self.stat = CacheStat()
         self.last_refresh_time = time.time()
         self.INSPECT_INTERVAL = 10
@@ -142,6 +143,8 @@ class LRUMLEvictor(Evictor):
         )
 
     def calc_score(self, last_accessed, cache_hint):
+        if self.lru:
+            return last_accessed
         if 'next_timestamp' in cache_hint:
             return -cache_hint['next_timestamp']
         if 'prob_has_next' in cache_hint:
@@ -352,8 +355,13 @@ class LRUEvictor(Evictor):
     def num_blocks(self) -> int:
         return len(self.free_table)
 
-
 def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
+    evictor = LRUMLEvictor(config)
+    if 'lru' in eviction_algorithm:
+        evictor.lru = 1
+    return evictor
+
+def make_evictor_(eviction_algorithm: str, config: str) -> Evictor:
     if eviction_algorithm == 'lru':
         return LRUEvictor()
     elif eviction_algorithm.startswith('lru-ml'):
