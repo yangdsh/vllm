@@ -10,6 +10,13 @@ from sortedcontainers import SortedDict
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
 
+def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time):
+    if prob_has_next == 0:
+        return 0.0
+    prob_not_accessed_till_now = np.exp(-elapsed_time / exp_scale)
+    return (prob_has_next * prob_not_accessed_till_now) / (
+            prob_has_next * prob_not_accessed_till_now + (1 - prob_has_next)
+    )
 
 class EvictionPolicy(enum.Enum):
     """Enum for eviction policy used by make_evictor to instantiate the correct
@@ -119,12 +126,12 @@ class LRUMLEvictor(Evictor):
         self.free_table: Dict[int, BlockMetaData] = {}
         self.sorted_dict = SortedDict()
         self.id_to_last_access = {}
+        self.id_to_first_access = {}
         self.to_delete_blocks = []
         self.config = self.parse_str_to_dict(config)
-        self.lru = 0
         self.stat = CacheStat()
         self.last_refresh_time = time.time()
-        self.INSPECT_INTERVAL = 10
+        self.INSPECT_INTERVAL = 5
 
     def __contains__(self, block_id: int) -> bool:
         return block_id in self.free_table
@@ -134,23 +141,16 @@ class LRUMLEvictor(Evictor):
             return {}
         return {key: value for key, value in (pair.split("=", 1) for pair in s.split(","))}
 
-    def probability_of_future_arrival(self, prob_has_next, exp_scale, elapsed_time, future_window):
-        if prob_has_next == 0:
-            return 0.0
-        prob_not_accessed_till_now = np.exp(-elapsed_time / exp_scale)
-        return (prob_has_next * prob_not_accessed_till_now) / (
-                prob_has_next * prob_not_accessed_till_now + (1 - prob_has_next)
-        )
-
-    def calc_score(self, last_accessed, cache_hint):
-        if self.lru:
+    def calc_score(self, block_id, last_accessed, cache_hint):
+        if 'use_lru' in cache_hint and cache_hint['use_lru']:
             return last_accessed
+        if 'use_fifo' in cache_hint and cache_hint['use_fifo']:
+            return self.id_to_first_access[block_id]
         if 'next_timestamp' in cache_hint:
             return -cache_hint['next_timestamp']
         if 'prob_has_next' in cache_hint:
-            return self.probability_of_future_arrival(
-                cache_hint['prob_has_next'], cache_hint['exp_scale'],
-                time.time() - last_accessed, self.INSPECT_INTERVAL)
+            return probability_of_future_arrival(
+                cache_hint['prob_has_next'], cache_hint['exp_scale'], time.time() - last_accessed)
 
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
@@ -166,6 +166,7 @@ class LRUMLEvictor(Evictor):
             survival_time = time.time() - self.free_table[block_id].last_accessed
             self.stat.append("survival_times", survival_time)
             del self.free_table[block_id]
+            del self.id_to_first_access[block_id]
             return block_id, content_hash
         else:
             # print('block is not in the sorted_dict')
@@ -173,7 +174,8 @@ class LRUMLEvictor(Evictor):
     
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
-        score = self.calc_score(last_accessed, cache_hint)
+        score = self.calc_score(block_id, last_accessed, cache_hint)
+        # print("add: ", block_id, cache_hint['turns'])
         self.free_table[block_id] = BlockMetaData(content_hash,
                                                   num_hashed_tokens,
                                                   last_accessed,
@@ -181,19 +183,23 @@ class LRUMLEvictor(Evictor):
                                                   score)
         self.sorted_dict[(score, last_accessed, block_id)] = (block_id, content_hash)
         self.id_to_last_access[cache_hint['id']] = last_accessed
+        if block_id not in self.id_to_first_access:
+            self.id_to_first_access[block_id] = last_accessed
         if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:
             self._refresh()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
-        if block_id in self.free_table:
-            old_score = self.free_table[block_id].score
-            old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
-            if old_entry in self.sorted_dict:
-                del self.sorted_dict[old_entry]
-            else:
-                raise ValueError("the score is not found in sorted_dict")
+        if block_id not in self.free_table:
+            raise ValueError("Attempting to update block that's not in the evictor")
+        print("update: ", block_id, cache_hint['turns'])
+        old_score = self.free_table[block_id].score
+        old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
+        if old_entry in self.sorted_dict:
+            del self.sorted_dict[old_entry]
+        else:
+            raise ValueError("the score is not found in sorted_dict")
         
-        score = self.calc_score(last_accessed, cache_hint)
+        score = self.calc_score(block_id, last_accessed, cache_hint)
         self.free_table[block_id].last_accessed = last_accessed
         self.free_table[block_id].cache_hint = cache_hint
         self.free_table[block_id].score = score
@@ -201,10 +207,12 @@ class LRUMLEvictor(Evictor):
         self.sorted_dict[(score, last_accessed, block_id)] = (block_id, self.free_table[block_id].content_hash)
         self.id_to_last_access[cache_hint['id']] = last_accessed
 
+    # remove is only called by 'hit', the blocks will be added back later after decoding
     def remove(self, block_id: int):
         if block_id not in self.free_table:
             raise ValueError("Attempting to remove block that's not in the evictor")
         
+        # print("remove: ", block_id)
         old_score = self.free_table[block_id].score
         old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
         if old_entry in self.sorted_dict:
@@ -221,7 +229,7 @@ class LRUMLEvictor(Evictor):
         new_sorted_dict = SortedDict()
 
         for block_id, block in self.free_table.items():
-            score = self.calc_score(block.last_accessed, block.cache_hint)
+            score = self.calc_score(block_id, block.last_accessed, block.cache_hint)
             block.score = score
             new_sorted_dict[(score, block.last_accessed, block_id)] = (block_id, block.content_hash)
 
@@ -356,17 +364,7 @@ class LRUEvictor(Evictor):
         return len(self.free_table)
 
 def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
-    evictor = LRUMLEvictor(config)
-    if 'lru' in eviction_algorithm:
-        evictor.lru = 1
-    return evictor
-
-def make_evictor_(eviction_algorithm: str, config: str) -> Evictor:
     if eviction_algorithm == 'lru':
         return LRUEvictor()
-    elif eviction_algorithm.startswith('lru-ml'):
-        return LRUMLEvictor(config)
-    elif eviction_algorithm.startswith('ml'):
-        return LRUMLEvictor(config)
     else:
-        raise ValueError(f"Unknown cache eviction policy: {eviction_algorithm}")
+        return LRUMLEvictor(config)

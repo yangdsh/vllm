@@ -24,6 +24,15 @@ from learn_conversation import make_predictor
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
+chat_template = "{%- for message in messages %}" \
+        "{%- if message['role'] == 'user' %}" \
+        "{{ '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}" \
+        "{%- elif message['role'] == 'assistant' %}" \
+        "{{ '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}" \
+        "{%- endif %}{%- endfor %}" \
+        "{% if add_generation_prompt %}" \
+        "{{ '<|im_start|>assistant\n' }}" \
+        "{% endif %}"
 
 @dataclass
 class RequestFuncInput:
@@ -32,13 +41,16 @@ class RequestFuncInput:
     prompt_len: int
     output_len: int
     model: str
+    tokenizer: Optional[AutoTokenizer] = None
     model_name: Optional[str] = None
     logprobs: Optional[int] = None
     extra_body: Optional[dict] = None
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
+    user_latency: float = 0 # deprecated
     timestamp: float = 0
     next_timestamp: float = 0
+    timeout: float = 300
     id: int = 0
     conversation_id: int = -1
     turn_id: int = -1
@@ -46,7 +58,8 @@ class RequestFuncInput:
     exp_scale: float = 1
     checkpoint: str = ''
     use_oracle: float = 0
-    use_fifo: int = 0
+    use_token_id: int = 0
+    use_lru: int = 0
 
 
 @dataclass
@@ -264,6 +277,7 @@ async def async_request_openai_completions(
             "prompt": request_func_input.prompt,
             "temperature": 0.0,
             "max_tokens": request_func_input.output_len,
+            "min_tokens": request_func_input.output_len+1, 
             "logprobs": request_func_input.logprobs,
             "stream": True,
             "stream_options": {
@@ -346,7 +360,6 @@ async def async_request_openai_completions(
 
 
 conversation_history = defaultdict(list)
-start_time = 0
 n_follow_up = 0
 n_completed_req = 0
 n_running_req = 0
@@ -359,7 +372,6 @@ async def async_request_openai_chat_completions(
     global n_running_req
     global n_completed_req
     global n_follow_up
-    global start_time
     global predictor_instance
     if not predictor_instance and request_func_input.checkpoint:
         predictor_instance = make_predictor(request_func_input.checkpoint)
@@ -367,20 +379,31 @@ async def async_request_openai_chat_completions(
     assert api_url.endswith(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
+    start_time = time.time()
 
     # wait until all previous turns are finished
     while len(conversation_history[request_func_input.conversation_id]) != request_func_input.turn_id \
             and request_func_input.turn_id >= 0:
         await asyncio.sleep(1)
-        print("waiting for ", request_func_input.conversation_id)
-    if request_func_input.turn_id > 1:
+        if time.time() - start_time > request_func_input.timeout:
+            output = RequestFuncOutput()
+            output.error = "timeout"
+            return output
+    waited_time = time.time() - start_time
+    await asyncio.sleep(waited_time)
+    request_func_input.timestamp += waited_time
+    request_func_input.next_timestamp += waited_time
+
+    if request_func_input.turn_id >= 1:
         n_follow_up += 1
-        if n_follow_up % 10 == 0:
+        if n_follow_up % 100 == 0:
             print("number of follow up requests: ", n_follow_up)
 
-    if request_func_input.conversation_id == 0 and request_func_input.turn_id == 0:
-        start_time = time.time()
-
+    def print_conversation_history(tokenizer, conversation_id):
+        for message in conversation_history[conversation_id]:
+            decoded_text = tokenizer.decode(message['token_ids'], skip_special_tokens=True)
+            print(f"role: {message['role']}\n{message['content']}\n{decoded_text}\n")
+    
     def get_messages(request_func_input):
         conversation_id = request_func_input.conversation_id
         content = [{"type": "text", "text": request_func_input.prompt}]
@@ -388,22 +411,42 @@ async def async_request_openai_chat_completions(
             content.append(request_func_input.multi_modal_content)
         user_message = {
                 "role": "user",
-                "content": request_func_input.prompt
+                "content": request_func_input.prompt,
             }
+        if len(conversation_history[conversation_id]) == 0:
+            token_ids = request_func_input.tokenizer.apply_chat_template([user_message], tokenize=True, 
+                add_generation_prompt=True)
+        else:
+            token_ids = request_func_input.tokenizer.apply_chat_template([user_message], tokenize=True,
+                chat_template=chat_template, add_generation_prompt=True)
+        user_message["token_ids"] = token_ids
         conversation_history[conversation_id].append(user_message)
+        # print_conversation_history(request_func_input.tokenizer, conversation_id)
         return conversation_history[conversation_id]
+
+    def get_prompt_tokens(request_func_input):
+        conversation_id = request_func_input.conversation_id
+        prompt_tokens = []
+        for message in conversation_history[conversation_id]:
+            prompt_tokens += message['token_ids']
+        # print('client token_ids: ', prompt_tokens)
+        # decoded_text = request_func_input.tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+        # print('client prompt: ', decoded_text)
+        return prompt_tokens
     
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
         turns = len(conversation_history[conversation_id]) // 2
+        true_label = (request_func_input.next_timestamp < 1e8)
         if predictor_instance:
-            prob_has_next = predictor_instance.predict_prob(conversation_history[conversation_id], turns)
+            prob_has_next = predictor_instance.predict_prob(
+                conversation_history[conversation_id], turns, true_label)
             # print(prob_has_next, request_func_input.next_timestamp)
         else:
             prob_has_next = 1
         # oracle
         if request_func_input.use_oracle > 0:
-            prob_has_next = (request_func_input.next_timestamp < 1e8)
+            prob_has_next = true_label
             if request_func_input.use_oracle < 1:
                 # with probablity 1 - request_func_input.use_oracle, flip
                 error_rate = (1-request_func_input.use_oracle)
@@ -419,19 +462,18 @@ async def async_request_openai_chat_completions(
                 "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
                 "id": conversation_id,
                 }
-        if request_func_input.use_fifo > 0:
-            hint['use_fifo'] = 1
         if request_func_input.use_oracle == 2:
             hint["next_timestamp"] = request_func_input.next_timestamp
-        # if conversation_id == 32:
-        #     print('~', conversation_id, request_func_input.timestamp)
+        if request_func_input.use_lru:
+            hint['use_lru'] = 1
         return hint
     
-    def update_conversation(conversation_id, generated_text):
+    def update_conversation(conversation_id, generated_text, generated_tokens):
         conversation_history[conversation_id].append(
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": generated_text}]
+                "content": [{"type": "text", "text": generated_text}],
+                "token_ids": generated_tokens
             }
         )
     
@@ -443,14 +485,15 @@ async def async_request_openai_chat_completions(
             "messages": get_messages(request_func_input),
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
+            "min_tokens": request_func_input.output_len, 
             "stream": True,
             "stream_options": {
                 "include_usage": True,
             },
             "cache_hint": get_cache_hint(request_func_input),
         }
-        #if request_func_input.conversation_id in [39, 86]:
-        #    print(request_func_input, get_cache_hint(request_func_input))
+        if request_func_input.use_token_id:
+            payload["prompt_tokens"] = get_prompt_tokens(request_func_input)
         if request_func_input.ignore_eos:
             payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:
@@ -464,6 +507,7 @@ async def async_request_openai_chat_completions(
         output.prompt_len = request_func_input.prompt_len
 
         generated_text = ""
+        generated_tokens = []
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -487,6 +531,9 @@ async def async_request_openai_chat_completions(
 
                             if choices := data.get("choices"):
                                 content = choices[0]["delta"].get("content")
+                                if "token_ids" in choices[0]:
+                                    token_id = choices[0]["token_ids"]
+                                    generated_tokens += token_id
                                 # First token
                                 if ttft == 0.0:
                                     ttft = timestamp - st
@@ -505,7 +552,11 @@ async def async_request_openai_chat_completions(
                             most_recent_timestamp = timestamp
 
                     output.generated_text = generated_text
-                    update_conversation(request_func_input.conversation_id, generated_text)
+                    end_tokens = request_func_input.tokenizer.encode('<|im_end|>\n')
+                    # print("generated: ", generated_text)
+                    if generated_tokens[-2] != end_tokens[-2]:
+                        generated_tokens += end_tokens
+                    update_conversation(request_func_input.conversation_id, generated_text, generated_tokens)
                     output.success = True
                     output.latency = most_recent_timestamp - st
                     #print(request_func_input.conversation_id, request_func_input.turn_id,
@@ -514,7 +565,7 @@ async def async_request_openai_chat_completions(
                     output.error = response.reason or ""
                     output.success = False
                     error_text = await response.text()
-                    update_conversation(request_func_input.conversation_id, "Error")
+                    update_conversation(request_func_input.conversation_id, "Error", [])
                     print("Response status:", response.status)
                     print("Response headers:", response.headers)
                     print("Response body:", error_text)

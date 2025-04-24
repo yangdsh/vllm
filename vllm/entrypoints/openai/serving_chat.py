@@ -34,11 +34,12 @@ from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.sequence import Logprob
-from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
+from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer, AutoTokenizer
 from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids)
 
 logger = init_logger(__name__)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -196,6 +197,14 @@ class OpenAIServingChat(OpenAIServing):
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
                 add_special_tokens=request.add_special_tokens,
             )
+            # overwrite the tokens with the input
+            if request.prompt_tokens:
+                #if engine_prompts[0]['prompt_token_ids'] != request.prompt_tokens:
+                #    print('before: ', tokenizer.decode(engine_prompts[0]['prompt_token_ids']))
+                #    print('after:  ', tokenizer.decode(request.prompt_tokens))
+                #    print('before: ', engine_prompts[0]['prompt_token_ids'])
+                #    print('after:  ', request.prompt_tokens)
+                engine_prompts[0]['prompt_token_ids'] = request.prompt_tokens
         except ValueError as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
@@ -551,6 +560,7 @@ class OpenAIServingChat(OpenAIServing):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
+                            token_ids=output.token_ids,
                             logprobs=logprobs,
                             finish_reason=None)
 
@@ -610,6 +620,7 @@ class OpenAIServingChat(OpenAIServing):
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
+                            token_ids=output.token_ids,
                             logprobs=logprobs,
                             finish_reason=output.finish_reason
                             if not auto_tools_called else "tool_calls",

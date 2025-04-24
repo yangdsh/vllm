@@ -213,6 +213,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
+    prompt_tokens: Optional[list] = None
     model: Optional[str] = None
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[dict[str, float]] = None
@@ -1279,6 +1280,7 @@ class DeltaMessage(OpenAIBaseModel):
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
     delta: DeltaMessage
+    token_ids: Optional[list[int]] = None,
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None

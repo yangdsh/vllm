@@ -12,7 +12,7 @@ from vllm.core.block.interfaces import (Block, BlockAllocator, BlockId, Device,
                                         DeviceAwareBlockAllocator)
 from vllm.core.block.naive_block import (BlockPool, NaiveBlock,
                                          NaiveBlockAllocator)
-from vllm.core.evictor import EvictionPolicy, Evictor, make_evictor
+from vllm.core.evictor import EvictionPolicy, Evictor, make_evictor, probability_of_future_arrival
 from vllm.logger import init_logger
 from vllm.sequence import Sequence
 
@@ -25,6 +25,7 @@ _DEFAULT_LAST_ACCESSED_TIME = -1
 
 logger = init_logger(__name__)
 
+DEBUG_CACHE = 0
 
 class BlockTracker:
     """Used to track the status of a block inside the prefix caching allocator
@@ -50,13 +51,25 @@ class BlockTracker:
         self.active = False
         self.reset()
     
-    def overwrite_cache_hint(self, cache_hint):
+    def overwrite_block_metadata(self, last_accessed, cache_hint):
         if self.cache_hint is None:
             self.cache_hint = cache_hint
         else:
-            # todo: keep the one with smaller TTA
-            if self.cache_hint['turns'] < cache_hint['turns']:
+            # the same conversation
+            if self.cache_hint['id'] == cache_hint['id']:
+                if self.cache_hint['turns'] < cache_hint['turns']:
+                    self.cache_hint = cache_hint
+            elif 'next_timestamp' in cache_hint:
+                if self.cache_hint['next_timestamp'] < cache_hint['next_timestamp']:
+                    self.cache_hint = cache_hint
+            else:
+                p = probability_of_future_arrival(
+                    self.cache_hint['prob_has_next'], self.cache_hint['exp_scale'], 
+                    last_accessed - self.last_accessed)
+                if p > cache_hint['prob_has_next']:
+                    cache_hint['prob_has_next'] = p
                 self.cache_hint = cache_hint
+        self.last_accessed = last_accessed
 
 class PrefixCachingBlockAllocator(BlockAllocator):
     """A block allocator that implements prefix caching.
@@ -91,6 +104,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         eviction_algorithm: str = 'lru',
         eviction_algorithm_config: str = ''
     ):
+        self.block_table = {}
         if block_ids is None:
             block_ids = range(num_blocks)
 
@@ -192,8 +206,13 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                                             extra_hash=extra_hash)
         assert block.content_hash is not None
 
+        if DEBUG_CACHE:
+            print('look up:      ', block.token_ids)
         cached_block_id = self._cached_blocks.get(block.content_hash, None)
         if cached_block_id is not None:
+            hit_block = self.block_table[cached_block_id]
+            if DEBUG_CACHE:
+                print('hit: ', hit_block.block_id, hit_block.token_ids)
             self.metric_data.query(hit=True)
             block.block_id = cached_block_id
             self._incr_refcount_cached_block(block)
@@ -349,11 +368,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             # assert content_hash_to_evict in self._cached_blocks
             if content_hash_to_evict in self._cached_blocks:
                 _block_id = self._cached_blocks[content_hash_to_evict]
-                assert self._refcounter.get(_block_id) == 0
+                # assert self._refcounter.get(_block_id) == 0
                 # assert _block_id == block_id
-                if _block_id == block_id:
+                if _block_id == block_id and self._refcounter.get(_block_id) == 0:
                     self._cached_blocks.pop(content_hash_to_evict)
                     break
+            print(f"cannot evict: {content_hash_to_evict in self._cached_blocks}")
 
         self._refcounter.incr(block_id)
         self._track_block_id(block_id, computed=False)
@@ -528,6 +548,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             # Note that this block cannot be marked as computed yet
             # because other sequences in the same batch cannot reuse
             # this block.
+            if DEBUG_CACHE:
+                print('promote: ', block.block_id, block.content_hash)
+            self.block_table[block.block_id] = block
             self._cached_blocks[block.content_hash] = block.block_id
             # Mark this block as touched so that it can be marked as
             # computed after the entire batch of sequences are scheduled.
@@ -589,9 +612,9 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
         for block_id in block_ids:
             if self._block_tracker[block_id].active:
-                self._block_tracker[block_id].last_accessed = now
-                self._block_tracker[block_id].overwrite_cache_hint(cache_hint)
+                self._block_tracker[block_id].overwrite_block_metadata(now, cache_hint)
             elif block_id in self.evictor:
+                print(f'block {cache_hint} is updated in the evictor')
                 self.evictor.update(block_id, now, cache_hint)
             else:
                 raise ValueError(
@@ -796,6 +819,8 @@ class PrefixCachingBlock(Block):
         self._last_accessed: float = _DEFAULT_LAST_ACCESSED_TIME
         self._computed = computed
         self._extra_hash = extra_hash
+        if DEBUG_CACHE:
+            print('init: ', block_id, token_ids)
 
         # On the first time, we create the block object, and next we only
         # reinitialize it
@@ -863,6 +888,8 @@ class PrefixCachingBlock(Block):
         # Ensure there are input tokens
         assert token_ids, "Got token_ids = {}".format(token_ids)
 
+        if DEBUG_CACHE:
+            print('append: ', self.block_id, token_ids)
         # Naive block handles CoW.
         self._block.append_token_ids(token_ids)
         self._update_num_tokens_total()
@@ -1152,11 +1179,9 @@ class LastAccessBlocksTracker:
         ts = self._seq_last_access[seq_id]
         cache_hint = self._seq_cache_hint[seq_id]
 
-        # print('mark blocks? ', seq_id, cache_hint)
         if ts is None:
             # No last access was recorded, no need to update.
             return
-        # print('mark blocks: ', seq_id, cache_hint)
         self._allocator.mark_blocks_as_accessed(block_ids, ts, cache_hint)
 
 

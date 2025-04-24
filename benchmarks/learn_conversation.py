@@ -277,7 +277,7 @@ class FollowUpPredictor:
                 predictions = logits.detach().cpu().numpy()
             else:
                 probabilities = torch.softmax(logits, dim=1)
-                predictions = torch.argmax(logits, dim=1).cpu().numpy()
+                predictions = torch.argmax(probabilities, dim=1).cpu().numpy()
 
             y_true.extend(labels)
             y_pred.extend(predictions)
@@ -297,13 +297,16 @@ def combine_user_requests(messages):
     # Gather up to 5 most recent user messages (including the current one)
     user_msgs = []
     j = len(messages) - 1
-    value_tag = 'content'
-    if value_tag not in messages[0]:
-        value_tag = 'value'
+
     while j >= 0 and len(user_msgs) < 5:
-        user_msgs.append(messages[j][value_tag])
-        j -= 2
-    user_msgs.reverse()  # Order messages chronologically
+        if 'role' in messages[j]:
+            if messages[j]['role'] == 'user':
+                user_msgs.append(messages[j]['content'])
+        else:
+            if messages[j]['from'] == 'human':
+                user_msgs.append(messages[j]['value'])
+        j -= 1
+    # user_msgs.reverse()  # Order messages chronologically
 
     # Determine allowed words per message (total must not exceed 512 words)
     n = len(user_msgs)
@@ -324,12 +327,12 @@ def combine_user_requests(messages):
         processed_msgs.append(processed_msg)
 
     # Concatenate the processed user messages with the phrase in between
-    combined_text = " [new message]: ".join(processed_msgs)
+    combined_text = "\n[new message]: ".join(processed_msgs)
 
     return combined_text
 
 def format_text(combined_text, uuid):
-    combined_text = " [user id]: " + uuid + ". " + combined_text
+    # combined_text = " [user id]: " + uuid + ". " + combined_text
     combined_text = "query: " + combined_text
     return combined_text
 
@@ -360,16 +363,16 @@ def load_conv_data(data_source, N, format):
     
     for convo in data[:N]:
         messages = convo.get("conversation", []) #lmsys
-        role = "role"
-        user = "user"
+        role_tag = "role"
+        user_tag = "user"
         value_tag = 'content' 
         if len(messages) == 0:
             messages = convo.get("conversation_a", [])
         if len(messages) == 0: #sharegpt
-            role = "from"
-            user = "human"
-            messages = convo.get("conversations", [])
+            role_tag = "from"
+            user_tag = "human"
             value_tag = 'value'
+            messages = convo.get("conversations", [])
         turns = 0  # Initialize turns at the start of each conversation
 
         if len(messages) > 1:
@@ -381,13 +384,13 @@ def load_conv_data(data_source, N, format):
                 first_responses.append(response_tokens)
 
         for i in range(len(messages) - 1):
-            if messages[i][role] == user and messages[i + 1][role] in ("assistant", "gpt"):
+            if messages[i][role_tag] == user_tag and messages[i + 1][role_tag] in ("assistant", "gpt"):
 
 
                 # (Optionally, you can append the assistant_response here if needed)
                 # For example: combined_text += f" [assistant]: {assistant_response}"
 
-                follow_up = 1 if (i + 2 < len(messages) and messages[i + 2][role] == user) else 0
+                follow_up = 1 if (i + 2 < len(messages) and messages[i + 2][role_tag] == user_tag) else 0
 
                 combined_text = combine_user_requests(messages[:i+1])
                 conversation_features.append({
@@ -472,7 +475,7 @@ def load_conv_data(data_source, N, format):
             freq += res[1]
         return count, freq
 
-
+    '''
     trie, cnt = build_trie_with_freq(first_messages)
     print(cnt)
     # print_trie_levels(trie)
@@ -491,7 +494,7 @@ def load_conv_data(data_source, N, format):
 
     print("\n=== DataFrame Columns ===")
     print(df.columns)
-
+'''
     return df
 
 
@@ -502,7 +505,7 @@ num_layers=3
 
 # ==== RUN MODEL ====
 if __name__ == "__main__":
-    dataset_choice = "sharegpt" #"sharegpt" # "lmsys-chat-1m"
+    dataset_choice = "lmsys-chat-1m" #"sharegpt" # "lmsys-chat-1m"
 
     if dataset_choice == "lmsys-chat-1m":
         print("Loading dataset: LMSys-chat-1M from Hugging Face...")
@@ -514,7 +517,7 @@ if __name__ == "__main__":
         print(f"Loading dataset: ShareGPT")
         df = load_conv_data("../../ShareGPT_V3_unfiltered_cleaned_split.json", 100000, 'sharegpt')
     elif dataset_choice == "Tay":
-        print(f"Loading dataset: Tay from")
+        print(f"Loading dataset: Tay")
         df = load_conv_data("../../tay.json", 100000, 'sharegpt')
     elif dataset_choice == "chatbot_arena":
         print("Loading dataset: Chatbot Arena Conversations from Hugging Face...")
@@ -571,8 +574,10 @@ else:
             ).to(self.device)
             self.classifier.load_state_dict(torch.load(model_path, map_location=self.device))
             self.classifier.eval()
+            self.y_true = []
+            self.y_pred = []
 
-        def predict_prob(self, conv, turns, no_embedding=False):
+        def predict_prob(self, conv, turns, true_label, no_embedding=False):
             text = format_text(combine_user_requests(conv), '')
             embeddings = self.bert.encode([text], convert_to_tensor=True, batch_size=1)
             embeddings *= 0 if no_embedding else 1
@@ -586,7 +591,12 @@ else:
 
             prob_has_next = probabilities[0][1].item()  # probability for "having next turn"
 
-            # print(text, turns)
+            self.y_true.append(true_label)
+            self.y_pred.append(prob_has_next > 0.5)
+
+            if len(self.y_true) % 100 == 0:
+                precision, recall, f1 = calculate_metrics(self.y_true, self.y_pred)
+                print(f"Test Precision: {precision:.4f}, Recall: {recall:.4f}, F1-score: {f1}")
 
             return prob_has_next
 

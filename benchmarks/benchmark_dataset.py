@@ -332,11 +332,13 @@ class ShareGPTDataset(BenchmarkDataset):
                 self.data = json.load(f)
             self.conv_tag = 'conversations'
             self.value_tag = 'value'
+            self.role_tag = 'from'
         else:
             ds = load_dataset(self.dataset_path)
             self.data = ds["train"].to_pandas().to_dict(orient="records")
             self.conv_tag = 'conversation'
             self.value_tag = 'content'
+            self.role_tag = 'role'
         # Filter entries with at least two conversation turns.
         self.data = [
             entry for entry in self.data
@@ -356,21 +358,27 @@ class ShareGPTDataset(BenchmarkDataset):
                human_delay: float = 5,
                **kwargs) -> list:
         samples: list = []
-        conv_timestamp = 0
+        conv_timestamp = 0.01
         for entry in self.data:
-            #if len(entry[self.conv_tag])//2 != 1:
+            # only first n turns
+            #if len(entry[self.conv_tag])//2 > 2:
             #    continue
-            conv_timestamp += np.random.exponential(conv_scale)
             req_timestamp = conv_timestamp
-            for turn in range(len(entry[self.conv_tag])//2):
+            i = 0 # user turn
+            turn_id = 0
+            while True:
                 if len(samples) >= num_requests:
                     break
-                if turn * 2 + 1 >= len(entry[self.conv_tag]):
+                j = i + 1 # gpt turn
+                while j < len(entry[self.conv_tag]) and \
+                        entry[self.conv_tag][j][self.role_tag] in ['human', 'user']:
+                    j += 1
+                if j >= len(entry[self.conv_tag]):
                     break
                 #if turn >= 1: # MAX_TURNS=16
                 #    break
-                prompt, completion = entry[self.conv_tag][turn * 2][self.value_tag],\
-                    entry[self.conv_tag][turn * 2 + 1][self.value_tag]
+                prompt, completion = entry[self.conv_tag][i][self.value_tag],\
+                    entry[self.conv_tag][j][self.value_tag]
 
                 lora_request, tokenizer = self.get_random_lora_request(
                     tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
@@ -379,8 +387,6 @@ class ShareGPTDataset(BenchmarkDataset):
                 prompt_len = len(prompt_ids)
                 new_output_len = (len(completion_ids)
                                 if output_len is None else output_len)
-                #if turn == len(entry[self.conv_tag])//2 - 1:
-                #    new_output_len = 1
                 #if not is_valid_sequence(prompt_len,
                 #                        new_output_len,
                 #                        skip_min_output_len_check=output_len
@@ -393,17 +399,19 @@ class ShareGPTDataset(BenchmarkDataset):
                         expected_output_len=new_output_len,
                         lora_request=lora_request,
                         conversation_id=self.conversation_id,
-                        turn_id=turn*2,
+                        turn_id=turn_id,
                         timestamp=req_timestamp,
                     ))
-                if "timestamp" not in entry[self.conv_tag][turn * 2]:
-                    req_timestamp += np.random.exponential(req_scale) + human_delay
-                else:
-                    if (turn+1) * 2 + 1 < len(entry[self.conv_tag]):
-                        req_timestamp = conv_timestamp + entry[self.conv_tag][(turn+1) * 2]["timestamp"] * req_scale
-                if (turn+1) * 2 + 1 < len(entry[self.conv_tag]):
+                turn_id += 2
+                if j + 1 < len(entry[self.conv_tag]):
+                    if "timestamp" in entry[self.conv_tag][i]:
+                        req_timestamp = conv_timestamp + entry[self.conv_tag][i]["timestamp"] * req_scale
+                    else:
+                        req_timestamp += np.random.exponential(req_scale) + human_delay
                     samples[-1].next_timestamp = req_timestamp
+                i = j + 1
             self.conversation_id += 1
+            conv_timestamp += np.random.exponential(conv_scale)
         # random.shuffle(samples) # todo
         samples.sort(key=lambda x: x.timestamp)
         return samples

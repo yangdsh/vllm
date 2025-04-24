@@ -292,6 +292,7 @@ async def benchmark(
         model=model_id,
         model_name=model_name,
         prompt=test_prompt,
+        tokenizer=tokenizer,
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
@@ -324,6 +325,7 @@ async def benchmark(
         profile_input = RequestFuncInput(model=model_id,
                                          model_name=model_name,
                                          prompt=test_prompt,
+                                         tokenizer=tokenizer,
                                          api_url=base_url + "/start_profile",
                                          prompt_len=test_prompt_len,
                                          output_len=test_output_len,
@@ -369,7 +371,7 @@ async def benchmark(
             request.prompt_len, request.expected_output_len, \
                 request.multi_modal_data, request.conversation_id, request.turn_id
         if last_conversation_id > 0 and conversation_id == last_conversation_id:
-            print(last_conversation_id, conversation_id)
+            print("Early termination after seeing the last conversation id: ", last_conversation_id)
             # skip cool down
             break
         req_model_id, req_model_name = model_id, model_name
@@ -380,6 +382,7 @@ async def benchmark(
         request_func_input = RequestFuncInput(model=req_model_id,
                                               model_name=req_model_name,
                                               prompt=prompt,
+                                              tokenizer=tokenizer,
                                               api_url=api_url,
                                               prompt_len=prompt_len,
                                               output_len=output_len,
@@ -393,18 +396,28 @@ async def benchmark(
                                               exp_scale=1/args.request_rate,
                                               checkpoint=args.checkpoint,
                                               use_oracle=args.use_oracle,
-                                              use_fifo=args.use_fifo)
+                                              use_token_id=args.use_token_id,
+                                              use_lru=args.use_lru)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
                                      pbar=pbar)))
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    all_outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+    timeout_cnt = 0
+    outputs = []
+    for output in all_outputs:
+        if output.error == "timeout":
+            timeout_cnt += 1
+        else:
+            outputs.append(output)
+    print("number of timeouts: ", timeout_cnt)
 
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
             model=model_id,
             prompt=test_prompt,
+            tokenizer=tokenizer,
             api_url=base_url + "/stop_profile",
             prompt_len=test_prompt_len,
             output_len=test_output_len,
@@ -791,7 +804,12 @@ if __name__ == "__main__":
         help= "future info is used in the cache hint, 1: has_next_turn; 2: tta",
     )
     parser.add_argument(
-        "--use-fifo",
+        "--use-token-id",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--use-lru",
         type=int,
         default=0,
     )
