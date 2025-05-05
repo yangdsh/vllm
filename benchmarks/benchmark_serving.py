@@ -661,7 +661,9 @@ def main(args: argparse.Namespace):
                                         num_requests=args.num_prompts,
                                         output_len=args.sharegpt_output_len,
                                         conv_scale=1/args.session_rate,
-                                        req_scale=1/args.request_rate
+                                        req_scale=1/args.request_rate,
+                                        max_active_conversations=args.max_active_conversations,
+                                        time_limit=args.time_limit
                                     ),
             "burstgpt":
             lambda: BurstGPTDataset(random_seed=args.seed,
@@ -859,6 +861,16 @@ if __name__ == "__main__":
               "is disabled, no logprobs are computed & a single dummy "
               "logprob is returned for each token; or (2) if beam search "
               "is enabled 1 logprob per token is computed"),
+    )
+    parser.add_argument(
+        "--max-active-conversations",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--time-limit",
+        type=int,
+        default=10000,
     )
     parser.add_argument(
         "--request-rate",

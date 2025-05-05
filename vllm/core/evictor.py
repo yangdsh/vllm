@@ -10,7 +10,7 @@ from sortedcontainers import SortedDict
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
 
-def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time):
+def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time, debug=False):
     if prob_has_next == 0:
         return 0.0
     prob_not_accessed_till_now = np.exp(-elapsed_time / exp_scale)
@@ -149,8 +149,9 @@ class LRUMLEvictor(Evictor):
         if 'next_timestamp' in cache_hint:
             return -cache_hint['next_timestamp']
         if 'prob_has_next' in cache_hint:
-            return probability_of_future_arrival(
+            prob = probability_of_future_arrival(
                 cache_hint['prob_has_next'], cache_hint['exp_scale'], time.time() - last_accessed)
+            return prob
 
     def evict(self) -> Tuple[int, int]:
         if len(self.free_table) == 0:
@@ -175,7 +176,7 @@ class LRUMLEvictor(Evictor):
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
         score = self.calc_score(block_id, last_accessed, cache_hint)
-        # print("add: ", block_id, cache_hint['turns'])
+        # print("add: ", block_id, cache_hint)
         self.free_table[block_id] = BlockMetaData(content_hash,
                                                   num_hashed_tokens,
                                                   last_accessed,

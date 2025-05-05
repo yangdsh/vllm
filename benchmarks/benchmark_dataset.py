@@ -16,6 +16,7 @@ SampleRequest instances, similar to the approach used in ShareGPT.
 
 import base64
 import io
+import heapq
 import json
 import random
 from abc import ABC, abstractmethod
@@ -348,71 +349,133 @@ class ShareGPTDataset(BenchmarkDataset):
         random.shuffle(self.data)
 
     def sample(self,
-               tokenizer: PreTrainedTokenizerBase,
+               tokenizer: 'PreTrainedTokenizerBase', # Use quotes if class not defined yet
                num_requests: int,
                lora_path: Optional[str] = None,
                max_loras: Optional[int] = None,
                output_len: Optional[int] = None,
-               conv_scale: float = 0.25,
-               req_scale: float = 10,
-               human_delay: float = 5,
+               conv_scale: float = 0.25, # Avg time between start of conversations
+               req_scale: float = 10,    # Avg time between requests within a conv
+               human_delay: float = 5,   # Fixed delay added for human turns
+               max_active_conversations: int = 100,
+               time_limit: int = 480,
                **kwargs) -> list:
         samples: list = []
-        conv_timestamp = 0.01
-        for entry in self.data:
-            # only first n turns
-            #if len(entry[self.conv_tag])//2 > 2:
-            #    continue
-            req_timestamp = conv_timestamp
-            i = 0 # user turn
-            turn_id = 0
-            while True:
-                if len(samples) >= num_requests:
-                    break
-                j = i + 1 # gpt turn
-                while j < len(entry[self.conv_tag]) and \
-                        entry[self.conv_tag][j][self.role_tag] in ['human', 'user']:
-                    j += 1
-                if j >= len(entry[self.conv_tag]):
-                    break
-                #if turn >= 1: # MAX_TURNS=16
-                #    break
-                prompt, completion = entry[self.conv_tag][i][self.value_tag],\
-                    entry[self.conv_tag][j][self.value_tag]
+        # Stores the timestamp of the *last* request for potentially active conversations.
+        # Using a min-heap allows efficient retrieval of the earliest finish time.
+        active_conv_finish_times = [] # Store finish times as a min-heap
+        self.conversation_id = 0 # Ensure conversation ID starts fresh
+        last_conv_start_timestamp = 0.0 # Track the start time of the previous conv
 
-                lora_request, tokenizer = self.get_random_lora_request(
-                    tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
-                prompt_ids = tokenizer(prompt).input_ids
-                completion_ids = tokenizer(completion).input_ids
-                prompt_len = len(prompt_ids)
-                new_output_len = (len(completion_ids)
-                                if output_len is None else output_len)
-                #if not is_valid_sequence(prompt_len,
-                #                        new_output_len,
-                #                        skip_min_output_len_check=output_len
-                #                        is not None):
-                #    continue
-                samples.append(
-                    SampleRequest(
+        for entry_index, entry in enumerate(self.data):
+            if len(samples) >= num_requests:
+                break
+            if last_conv_start_timestamp > time_limit:
+                break
+
+            # --- Calculate potential start time for this new conversation ---
+            # Start with a base time slightly after the previous conversation *started*,
+            # plus the random interval.
+            potential_conv_timestamp = last_conv_start_timestamp + np.random.exponential(conv_scale)
+
+            # --- Prune conversations that are no longer active ---
+            # Remove finish times from the heap that are <= the *potential* start time
+            # of the new conversation. These conversations have finished before the new one might start.
+            while active_conv_finish_times and active_conv_finish_times[0] <= potential_conv_timestamp:
+                heapq.heappop(active_conv_finish_times)
+
+            # --- Check if active conversation limit is reached ---
+            while len(active_conv_finish_times) >= max_active_conversations * (1-last_conv_start_timestamp/time_limit/2):
+                # Wait until the earliest active conversation finishes.
+                earliest_finish_time = heapq.heappop(active_conv_finish_times)
+                # The new conversation cannot start before this time.
+                potential_conv_timestamp = max(potential_conv_timestamp, earliest_finish_time)
+                # Re-prune based on the potentially updated (later) start time.
+                # (This loop handles cases where multiple conversations finish at nearly the same time)
+                while active_conv_finish_times and active_conv_finish_times[0] <= potential_conv_timestamp:
+                   heapq.heappop(active_conv_finish_times)
+
+            # --- Finalize start time for this conversation ---
+            conv_timestamp = potential_conv_timestamp
+            last_conv_start_timestamp = conv_timestamp # Update for the next iteration
+            req_timestamp = conv_timestamp # Timestamp for the *first* request
+
+            i = 0 # Start checking from the first turn in the entry
+            turn_id = 0 # Counter for valid turns found in this entry
+            last_req_timestamp_in_entry = -1.0 # Track the last request time for *this* entry
+
+            # --- Inner loop to process turns within the current conversation entry ---
+            while True:
+                # --- Termination conditions for inner loop ---
+                if len(samples) >= num_requests:
+                    break # Exit inner loop, outer loop will handle final break
+                #if turn_id >= 3: # MAX_TURNS=3 limit per conversation entry
+                #    break
+                if i >= len(entry[self.conv_tag]) - 1:
+                    break # No more pairs possible in this entry
+
+                # --- Core Logic: Check if 'i' is user and 'i+1' is not user ---
+                is_current_user = entry[self.conv_tag][i][self.role_tag] in ['human', 'user']
+                is_next_not_user = (i + 1 < len(entry[self.conv_tag])) and \
+                                   (entry[self.conv_tag][i + 1][self.role_tag] not in ['human', 'user'])
+
+                if is_current_user and is_next_not_user:
+                    prompt = entry[self.conv_tag][i][self.value_tag]
+                    completion = entry[self.conv_tag][i + 1][self.value_tag]
+
+                    lora_request, current_tokenizer = self.get_random_lora_request( # Use current_tokenizer
+                        tokenizer=tokenizer, max_loras=max_loras, lora_path=lora_path)
+                    prompt_ids = current_tokenizer(prompt).input_ids
+                    completion_ids = current_tokenizer(completion).input_ids
+                    prompt_len = len(prompt_ids)
+                    new_output_len = (len(completion_ids)
+                                    if output_len is None else output_len)
+
+                    # Create and add the sample
+                    current_sample = SampleRequest(
                         prompt=prompt,
                         prompt_len=prompt_len,
                         expected_output_len=new_output_len,
                         lora_request=lora_request,
                         conversation_id=self.conversation_id,
                         turn_id=turn_id,
-                        timestamp=req_timestamp,
-                    ))
-                turn_id += 2
-                if j + 1 < len(entry[self.conv_tag]):
+                        timestamp=req_timestamp, # Assign current request timestamp
+                    )
+                    samples.append(current_sample)
+                    last_req_timestamp_in_entry = req_timestamp # Update last timestamp for *this* entry
+                    turn_id += 1
+
+                    # --- Update timestamp for the *next* potential request *within this conversation* ---
+                    interval = 0
                     if "timestamp" in entry[self.conv_tag][i]:
                         req_timestamp = conv_timestamp + entry[self.conv_tag][i]["timestamp"] * req_scale
                     else:
                         req_timestamp += np.random.exponential(req_scale) + human_delay
-                    samples[-1].next_timestamp = req_timestamp
-                i = j + 1
+
+                    # Store the calculated timestamp for the *next* request in the *current* sample, if applicable
+                    if i + 2 < len(entry[self.conv_tag]):
+                        samples[-1].next_timestamp = req_timestamp
+
+                    # Advance index past the processed pair
+                    i += 2
+                else:
+                    # Condition not met, advance to the next potential start turn
+                    i += 1
+            # --- End of inner while loop (processing turns for one entry) ---
+
+            # If samples were generated for this conversation, record its finish time
+            if last_req_timestamp_in_entry >= 0:
+                 heapq.heappush(active_conv_finish_times, last_req_timestamp_in_entry)
+                 # print(f"DEBUG: Conv {self.conversation_id} finished. Last req at {last_req_timestamp_in_entry}. Heap size: {len(active_conv_finish_times)}") # Debug
+
+            # Increment conversation ID for the next entry
             self.conversation_id += 1
-            conv_timestamp += np.random.exponential(conv_scale)
-        # random.shuffle(samples) # todo
+
+        # --- End of outer for loop (processing entries) ---
+
+        print(f"Finished processing {entry_index+1} entries. Generated {len(samples)} samples.")
+
+        # Sort all collected samples by their request timestamp
         samples.sort(key=lambda x: x.timestamp)
         return samples
 

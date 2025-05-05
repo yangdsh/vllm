@@ -199,11 +199,11 @@ class OpenAIServingChat(OpenAIServing):
             )
             # overwrite the tokens with the input
             if request.prompt_tokens:
-                #if engine_prompts[0]['prompt_token_ids'] != request.prompt_tokens:
-                #    print('before: ', tokenizer.decode(engine_prompts[0]['prompt_token_ids']))
-                #    print('after:  ', tokenizer.decode(request.prompt_tokens))
-                #    print('before: ', engine_prompts[0]['prompt_token_ids'])
-                #    print('after:  ', request.prompt_tokens)
+                if engine_prompts[0]['prompt_token_ids'] != request.prompt_tokens:
+                    print('before text: ', tokenizer.decode(engine_prompts[0]['prompt_token_ids']))
+                    print('after text:  ', tokenizer.decode(request.prompt_tokens))
+                    print('before: ', engine_prompts[0]['prompt_token_ids'])
+                    print('after:  ', request.prompt_tokens)
                 engine_prompts[0]['prompt_token_ids'] = request.prompt_tokens
         except ValueError as e:
             logger.exception("Error in preprocessing prompt inputs")

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Token blocks."""
+import copy
 import sys
 from bisect import bisect_left
 from os.path import commonprefix
@@ -52,6 +53,7 @@ class BlockTracker:
         self.reset()
     
     def overwrite_block_metadata(self, last_accessed, cache_hint):
+        cache_hint = copy.deepcopy(cache_hint)
         if self.cache_hint is None:
             self.cache_hint = cache_hint
         else:
@@ -65,8 +67,9 @@ class BlockTracker:
             else:
                 p = probability_of_future_arrival(
                     self.cache_hint['prob_has_next'], self.cache_hint['exp_scale'], 
-                    last_accessed - self.last_accessed)
+                    last_accessed - self.last_accessed, debug=True)
                 if p > cache_hint['prob_has_next']:
+                    # print("overwrite: ", self.cache_hint, cache_hint)
                     cache_hint['prob_has_next'] = p
                 self.cache_hint = cache_hint
         self.last_accessed = last_accessed

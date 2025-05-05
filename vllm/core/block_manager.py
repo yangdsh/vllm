@@ -258,9 +258,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         seq_id = seq.seq_id
         if seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.
-            # print("already freed: ", seq_id, seq.cache_hint)
             return
-        # print('will free: ', seq_id, seq.cache_hint)
 
         # Update seq block ids with the latest access time
         self._last_access_blocks_tracker.update_blocks_metadata_using_seq_metadata(

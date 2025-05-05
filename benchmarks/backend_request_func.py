@@ -20,7 +20,7 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 
 from vllm.model_executor.model_loader.weight_utils import get_lock
 
-from learn_conversation import make_predictor
+from learn_conversation import MLModel, combine_user_requests
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -374,7 +374,8 @@ async def async_request_openai_chat_completions(
     global n_follow_up
     global predictor_instance
     if not predictor_instance and request_func_input.checkpoint:
-        predictor_instance = make_predictor(request_func_input.checkpoint)
+        predictor_instance = MLModel()
+        predictor_instance.load_model(request_func_input.checkpoint)
     api_url = request_func_input.api_url
     assert api_url.endswith(
         "chat/completions"
@@ -382,7 +383,8 @@ async def async_request_openai_chat_completions(
     start_time = time.time()
 
     # wait until all previous turns are finished
-    while len(conversation_history[request_func_input.conversation_id]) != request_func_input.turn_id \
+    cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
+    while cur_turn_id != request_func_input.turn_id \
             and request_func_input.turn_id >= 0:
         await asyncio.sleep(1)
         if time.time() - start_time > request_func_input.timeout:
@@ -413,10 +415,11 @@ async def async_request_openai_chat_completions(
                 "role": "user",
                 "content": request_func_input.prompt,
             }
+        # append system prompt to the first user message
         if len(conversation_history[conversation_id]) == 0:
             token_ids = request_func_input.tokenizer.apply_chat_template([user_message], tokenize=True, 
                 add_generation_prompt=True)
-        else:
+        else: # do not append system prompt to the other user messages
             token_ids = request_func_input.tokenizer.apply_chat_template([user_message], tokenize=True,
                 chat_template=chat_template, add_generation_prompt=True)
         user_message["token_ids"] = token_ids
@@ -436,11 +439,11 @@ async def async_request_openai_chat_completions(
     
     def get_cache_hint(request_func_input):
         conversation_id = request_func_input.conversation_id
-        turns = len(conversation_history[conversation_id]) // 2
+        turns = request_func_input.turn_id
         true_label = (request_func_input.next_timestamp < 1e8)
         if predictor_instance:
-            prob_has_next = predictor_instance.predict_prob(
-                conversation_history[conversation_id], turns, true_label)
+            prob_has_next = predictor_instance.predict_single_processed(
+                combine_user_requests(conversation_history[conversation_id]), turns, true_label)
             # print(prob_has_next, request_func_input.next_timestamp)
         else:
             prob_has_next = 1
