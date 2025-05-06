@@ -308,11 +308,14 @@ async def benchmark(
             f"are correctly specified. Error: {test_output}")
     else:
         print("Initial test run completed. Starting main benchmark run...")
-    response = requests.post(base_url + "/reset_prefix_cache")
-    if response.status_code == 200:
-        print("Prefix cache reset successfully.")
-    else:
-        print(f"Failed to reset prefix cache. Status code: {response.status_code}")
+    while True:
+        response = requests.post(base_url + "/reset_prefix_cache")
+        if response.status_code == 200:
+            print("Prefix cache reset successfully.")
+            break
+        else:
+            print(f"Failed to reset prefix cache. Status code: {response.status_code}")
+        await asyncio.sleep(10)
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -393,7 +396,9 @@ async def benchmark(
                                               turn_id=turn_id,
                                               timestamp=request.timestamp,
                                               next_timestamp=request.next_timestamp,
+                                              interval=request.interval,
                                               exp_scale=1/args.request_rate,
+                                              time_limit=args.time_limit,
                                               checkpoint=args.checkpoint,
                                               use_oracle=args.use_oracle,
                                               use_token_id=args.use_token_id,

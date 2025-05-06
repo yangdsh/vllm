@@ -50,7 +50,8 @@ class RequestFuncInput:
     user_latency: float = 0 # deprecated
     timestamp: float = 0
     next_timestamp: float = 0
-    timeout: float = 300
+    interval: float = 0
+    time_limit: float = 10000
     id: int = 0
     conversation_id: int = -1
     turn_id: int = -1
@@ -360,10 +361,12 @@ async def async_request_openai_completions(
 
 
 conversation_history = defaultdict(list)
+conversation_last_time = {}
 n_follow_up = 0
 n_completed_req = 0
 n_running_req = 0
 predictor_instance = None
+start_time = time.time()
 
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
@@ -373,6 +376,7 @@ async def async_request_openai_chat_completions(
     global n_completed_req
     global n_follow_up
     global predictor_instance
+    global start_time
     if not predictor_instance and request_func_input.checkpoint:
         predictor_instance = MLModel()
         predictor_instance.load_model(request_func_input.checkpoint)
@@ -380,21 +384,33 @@ async def async_request_openai_chat_completions(
     assert api_url.endswith(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
-    start_time = time.time()
 
+    receive_time = time.time()
+    if receive_time - start_time > request_func_input.time_limit:
+        output = RequestFuncOutput()
+        output.error = "timeout"
+        return output
     # wait until all previous turns are finished
     cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
-    while cur_turn_id != request_func_input.turn_id \
-            and request_func_input.turn_id >= 0:
-        await asyncio.sleep(1)
-        if time.time() - start_time > request_func_input.timeout:
+    if cur_turn_id > 0:
+        while cur_turn_id != request_func_input.turn_id \
+                and request_func_input.turn_id >= 0:
+            await asyncio.sleep(3)
+            if time.time() - start_time > request_func_input.time_limit:
+                output = RequestFuncOutput()
+                output.error = "timeout"
+                return output
+        scheduled_time = conversation_last_time[request_func_input.conversation_id] \
+            + request_func_input.interval
+        if scheduled_time - start_time > request_func_input.time_limit:
             output = RequestFuncOutput()
             output.error = "timeout"
             return output
-    waited_time = time.time() - start_time
-    await asyncio.sleep(waited_time)
-    request_func_input.timestamp += waited_time
-    request_func_input.next_timestamp += waited_time
+        wait_for = scheduled_time - time.time()
+        await asyncio.sleep(wait_for)
+        request_func_input.timestamp += time.time() - receive_time
+        request_func_input.next_timestamp += time.time() - receive_time \
+            + request_func_input.output_len / 30 # assume token throughput is 30
 
     if request_func_input.turn_id >= 1:
         n_follow_up += 1
@@ -479,6 +495,7 @@ async def async_request_openai_chat_completions(
                 "token_ids": generated_tokens
             }
         )
+        conversation_last_time[conversation_id] = time.time()
     
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:

@@ -81,9 +81,12 @@ def load_conv_data(data_source, N, turn_equal_to, format_hint):
     # train on last N conversations
     if N < 0:
         N = -N
-        total_length = len(data)
-        last_n_indices = list(range(total_length - N, total_length))
-        data = data.select(last_n_indices)
+        if isinstance(data, list):
+            data = data[-N:]
+        else:
+            total_length = len(data)
+            last_n_indices = list(range(total_length - N, total_length))
+            data = data.select(last_n_indices)
 
     first_item=data[0] if len(data)>0 else {}
     role_tag, user_tag, value_tag, msg_list_key = 'role', 'user', 'content', 'conversation'
@@ -104,7 +107,7 @@ def load_conv_data(data_source, N, turn_equal_to, format_hint):
             msg_i,msg_i_plus_1 = messages[i],messages[i+1]
             assistant_tags = ("assistant","gpt")
             if (msg_i.get(role_tag)==user_tag and msg_i_plus_1.get(role_tag) in assistant_tags):
-                if turns == turn_equal_to:
+                if turns <= turn_equal_to:
                     has_follow_up = (i+2<len(messages) and messages[i+2].get(role_tag)==user_tag)
                     true_label=1 if has_follow_up else 0
                     combined_text_input = combine_user_requests(messages[:i+1])
@@ -149,7 +152,8 @@ def prepare_dataloaders(
     label_col = "follow_up" if task == "classification" else "tta"
     if label_col not in df.columns: raise ValueError(f"Label column '{label_col}' not found.")
     try:
-        train_df, test_df = train_test_split( df, test_size=test_size, random_state=random_state, stratify=df[label_col] if task=='classification' and df[label_col].nunique() > 1 else None )
+        train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state, 
+            stratify=df[label_col] if task=='classification' and df[label_col].nunique() > 1 else None )
     except Exception as e:
         print(f"Could not stratify split (Error: {e}). Performing regular split.")
         train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
@@ -199,6 +203,7 @@ class MLModel:
                  dropout: float = 0.3, task: str = "classification", 
                  dataset_choice: Optional[str] = None, device: Optional[str] = None ):
         # (Initialization remains the same - no data attributes)
+        self.text_to_embedding = {}
         self.bert_model_name = bert_model_name; self.hidden_dim = hidden_dim
         self.num_layers = num_layers; self.dropout = dropout
         self.task = task; self.dataset_choice = dataset_choice
@@ -229,7 +234,7 @@ class MLModel:
         self.classifier.train()
         criterion = nn.CrossEntropyLoss() if self.task == "classification" else nn.MSELoss()
         optimizer = Adam(self.classifier.parameters(), lr=lr)
-        best_test_metric = -float('inf') # Use -inf since lower loss or higher F1 is better
+        best_test_metric = float('inf') # Use -inf since lower loss or higher F1 is better
         label_col = "follow_up" if self.task == "classification" else "tta"
 
         print(f"\n--- Starting Training ---")
@@ -250,9 +255,18 @@ class MLModel:
                     labels = labels.float().unsqueeze(1)
                 else: 
                     labels = labels.long()
-                with torch.no_grad(): 
-                    embeddings = self.bert.encode(list(input_texts), convert_to_tensor=True, 
-                                                  batch_size=len(input_texts))
+                with torch.no_grad():
+                    if epoch > 0:
+                        embeddings = []
+                        for text in list(input_texts):
+                            embedding = self.text_to_embedding[text]
+                            embeddings.append(embedding)
+                        embeddings = torch.stack(embeddings)
+                    else:
+                        embeddings = self.bert.encode(list(input_texts), convert_to_tensor=True, 
+                                                    batch_size=len(input_texts))
+                        for i in range(len(embeddings)):
+                            self.text_to_embedding[input_texts[i]] = embeddings[i]
                 if no_embedding: 
                     embeddings.zero_()
                 combined_features = torch.cat((embeddings, input_vals), dim=1)
@@ -271,6 +285,7 @@ class MLModel:
             y_true_eval = []
             y_pred_eval = []
             y_prob_eval = [] # Store probabilities for potential AUC calculation
+            test_loss_sum = 0
             start_time_eval = time.time()
 
             for idx, row in test_df.iterrows():
@@ -280,15 +295,19 @@ class MLModel:
 
                 # Get prediction/probability using the single prediction method
                 if self.task == "classification":
-                    prob = self.predict_single_processed(preprocessed_text, turns, no_embedding=no_embedding)
+                    logit = self.predict_single_processed(preprocessed_text, turns,
+                                                         no_embedding=no_embedding, return_prob=False)
+                    loss = criterion(logit, torch.tensor(true_label, dtype=torch.long).unsqueeze(0).to(self._device))
+                    test_loss_sum += loss.item()
+                    prob = torch.softmax(logit, dim=1)[0, 1].item()
                     pred_label = 1 if prob > 0.5 else 0 # Simple thresholding
                     y_prob_eval.append(prob)
                     y_pred_eval.append(pred_label)
                 else: # Regression
-                    pred_value = self.predict_single_processed(preprocessed_text, turns, no_embedding=no_embedding)
-                    y_pred_eval.append(pred_value)
-                    # For regression, 'prob' list might store predicted values if needed later
+                    pred_value = self.predict_single_processed(preprocessed_text, turns, 
+                                                               no_embedding=no_embedding)
                     y_prob_eval.append(pred_value)
+                    y_pred_eval.append(pred_value)
 
                 y_true_eval.append(true_label)
 
@@ -303,7 +322,9 @@ class MLModel:
                 final_metrics = calculate_metrics(y_true_eval, y_pred_eval, y_prob_eval)
                 print(f"Precision={final_metrics['precision']:.4f}, \
                       Recall={final_metrics['recall']:.4f}, F1={final_metrics['f1']}")
-                current_metric_val = (final_metrics['f1'][0] + final_metrics['f1'][1]) / 2
+                # current_metric_val = (final_metrics['f1'][0] + final_metrics['f1'][1]) / 2
+                current_metric_val = test_loss_sum / len(y_prob_eval)
+                print("test loss: ", current_metric_val)
             elif self.task == "regression" and len(y_true_eval) > 0:
                  # Calculate final regression metric (e.g., MSE)
                  final_mse = mean_squared_error(y_true_eval, y_pred_eval)
@@ -312,7 +333,7 @@ class MLModel:
                  current_metric_val = -final_mse # Use negative MSE (higher is better)
 
             # Save the best model
-            if current_metric_val > best_test_metric:
+            if current_metric_val <= best_test_metric:
                 best_test_metric = current_metric_val
                 metric_str = f"{current_metric_val:.4f}".replace('.', '_').replace('-', 'neg')
                 save_filename = f"{self.dataset_choice or 'model'}_epoch{epoch+1}_metric_{metric_str}.pt"
@@ -376,7 +397,7 @@ class MLModel:
             if return_prob:
                 return probabilities[0, 1].item() # Prob of class 1
             else:
-                return pred_label
+                return logits
 
     def save_model(self, save_path: str):
         save_content = {'model_state_dict': self.classifier.state_dict(), 
@@ -424,10 +445,10 @@ class MLModel:
 # ==== RUN MODEL ====
 if __name__ == "__main__":
     task_type = "classification"
-    dataset_choice = "lmsys-chat-1m" #"sharegpt" # "lmsys-chat-1m"
+    dataset_choice = 'chatbot_arena' #'tay' 'gpt4' #"chatbot_arena" #"sharegpt" # "lmsys-chat-1m"
 
-    N = -100000
-    turn_equal_to = 1
+    N = -20000
+    turn_equal_to = 20
     if dataset_choice == "lmsys-chat-1m":
         print("Loading dataset: LMSys-chat-1M from Hugging Face...")
         ds = load_dataset("lmsys/lmsys-chat-1m")  # Use authentication if required
@@ -435,19 +456,22 @@ if __name__ == "__main__":
     elif dataset_choice == "sharegpt":
         print(f"Loading dataset: ShareGPT")
         df = load_conv_data("../../ShareGPT_V3_unfiltered_cleaned_split.json", N, turn_equal_to, 'sharegpt')
-    elif dataset_choice == "Tay":
+    elif dataset_choice == "tay":
         print(f"Loading dataset: Tay")
-        df = load_conv_data("../../tay.json", N, turn_equal_to, 'sharegpt')
+        df = load_conv_data("../../tay.json", N, turn_equal_to, 'tay')
     elif dataset_choice == "chatbot_arena":
         print("Loading dataset: Chatbot Arena Conversations from Hugging Face...")
         ds = load_dataset("lmsys/chatbot_arena_conversations")
         df = load_conv_data(ds, N, turn_equal_to, 'chatbot_arena')
-    try:
-        train_loader, test_loader, test_df = prepare_dataloaders( # Get test_df back
-            df=df, task=task_type, batch_size=256, test_size=0.01
-        )
-    except Exception as e: print(f"Error preparing dataloaders: {e}\nExiting."); sys.exit(1)
-
+    elif dataset_choice == "gpt4":
+        print("Loading dataset: GPT4 Conversations from Hugging Face...")
+        ds = load_dataset("lightblue/gpt4_conversations_multilingual")
+        df = load_conv_data(ds, N, turn_equal_to, 'gpt4')
+    else:
+        print('dataset not found')
+    train_loader, test_loader, test_df = prepare_dataloaders( # Get test_df back
+        df=df, task=task_type, batch_size=256, test_size=0.01
+    )
     # --- Initialize Model ---
     mlmodel = MLModel(task=task_type, dataset_choice=dataset_choice)
 
@@ -458,7 +482,7 @@ if __name__ == "__main__":
         mlmodel.train(
             train_dataloader=train_loader,
             test_df=test_df, # Pass test_df for evaluation within train
-            num_epochs=5,
+            num_epochs=20,
             lr=1e-4,
             save_dir=checkpoint_dir
         )
@@ -473,7 +497,7 @@ if __name__ == "__main__":
         mlmodel_loaded = MLModel(task=task_type, dataset_choice=dataset_choice)
         mlmodel_loaded.load_model(best_checkpoint_path) # load_model sets to eval()
 
-        # --- Example: Single Prediction on PREPROCESSED Data ---
+        # --- sanity check for online prediction ---
         print("\n--- Example: Single Prediction (using loaded model) ---")
         sum_true_label = 0
         for i in range(1000):
@@ -486,10 +510,9 @@ if __name__ == "__main__":
             sum_true_label += true_label_example
 
             prob = mlmodel_loaded.predict_single_processed(example_text, example_turns, true_label_example)
-            label = prob > 0.5
-            if i < 20:
-                print(f"Input Text: '{example_text[:100]}...' (Turns={example_turns})")
-                print(f"True Label: {true_label_example}, Prob(Follow-up): {prob:.4f}")
+            #if i < 20:
+            #    print(f"Input Text: '{example_text[:100]}...' (Turns={example_turns})")
+            #    print(f"True Label: {true_label_example}, Prob(Follow-up): {prob:.4f}")
         print("has follow up: ", sum_true_label, "/", len(test_df))
     except IndexError: print(f"\nNo checkpoints found in '{checkpoint_dir}'.")
     except Exception as e: print(f"\nError during loading/prediction example: {e}")

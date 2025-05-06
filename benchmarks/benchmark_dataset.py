@@ -56,6 +56,7 @@ class SampleRequest:
     turn_id: int = -1
     timestamp: int = 0
     next_timestamp: int = 1e9
+    interval: int = 0
 
 
 # -----------------------------------------------------------------------------
@@ -331,15 +332,21 @@ class ShareGPTDataset(BenchmarkDataset):
         if '.json' in self.dataset_path:
             with open(self.dataset_path, encoding="utf-8") as f:
                 self.data = json.load(f)
-            self.conv_tag = 'conversations'
-            self.value_tag = 'value'
-            self.role_tag = 'from'
         else:
             ds = load_dataset(self.dataset_path)
             self.data = ds["train"].to_pandas().to_dict(orient="records")
+        if 'lmsys' in self.dataset_path:
             self.conv_tag = 'conversation'
             self.value_tag = 'content'
             self.role_tag = 'role'
+        if 'chatbot_arena' in self.dataset_path:
+            self.conv_tag = 'conversation_a'
+            self.value_tag = 'content'
+            self.role_tag = 'role'
+        else:
+            self.conv_tag = 'conversations'
+            self.value_tag = 'value'
+            self.role_tag = 'from'
         # Filter entries with at least two conversation turns.
         self.data = [
             entry for entry in self.data
@@ -356,9 +363,9 @@ class ShareGPTDataset(BenchmarkDataset):
                output_len: Optional[int] = None,
                conv_scale: float = 0.25, # Avg time between start of conversations
                req_scale: float = 10,    # Avg time between requests within a conv
-               human_delay: float = 5,   # Fixed delay added for human turns
+               human_delay: float = 0,   # Fixed delay added for human turns
                max_active_conversations: int = 100,
-               time_limit: int = 480,
+               time_limit: int = 10000,
                **kwargs) -> list:
         samples: list = []
         # Stores the timestamp of the *last* request for potentially active conversations.
@@ -385,7 +392,7 @@ class ShareGPTDataset(BenchmarkDataset):
                 heapq.heappop(active_conv_finish_times)
 
             # --- Check if active conversation limit is reached ---
-            while len(active_conv_finish_times) >= max_active_conversations * (1-last_conv_start_timestamp/time_limit/2):
+            while len(active_conv_finish_times) >= max_active_conversations:
                 # Wait until the earliest active conversation finishes.
                 earliest_finish_time = heapq.heappop(active_conv_finish_times)
                 # The new conversation cannot start before this time.
@@ -402,7 +409,7 @@ class ShareGPTDataset(BenchmarkDataset):
 
             i = 0 # Start checking from the first turn in the entry
             turn_id = 0 # Counter for valid turns found in this entry
-            last_req_timestamp_in_entry = -1.0 # Track the last request time for *this* entry
+            last_req_timestamp = conv_timestamp
 
             # --- Inner loop to process turns within the current conversation entry ---
             while True:
@@ -440,19 +447,19 @@ class ShareGPTDataset(BenchmarkDataset):
                         conversation_id=self.conversation_id,
                         turn_id=turn_id,
                         timestamp=req_timestamp, # Assign current request timestamp
+                        interval=req_timestamp-last_req_timestamp
                     )
                     samples.append(current_sample)
-                    last_req_timestamp_in_entry = req_timestamp # Update last timestamp for *this* entry
+                    last_req_timestamp = req_timestamp # Update last timestamp for *this* entry
                     turn_id += 1
 
-                    # --- Update timestamp for the *next* potential request *within this conversation* ---
-                    interval = 0
+                    # --- Update timestamp for the *next* request *within this conversation* ---
                     if "timestamp" in entry[self.conv_tag][i]:
                         req_timestamp = conv_timestamp + entry[self.conv_tag][i]["timestamp"] * req_scale
                     else:
                         req_timestamp += np.random.exponential(req_scale) + human_delay
 
-                    # Store the calculated timestamp for the *next* request in the *current* sample, if applicable
+                    # Store the calculated timestamp for the *next* request in the *current* sample
                     if i + 2 < len(entry[self.conv_tag]):
                         samples[-1].next_timestamp = req_timestamp
 
@@ -464,10 +471,8 @@ class ShareGPTDataset(BenchmarkDataset):
             # --- End of inner while loop (processing turns for one entry) ---
 
             # If samples were generated for this conversation, record its finish time
-            if last_req_timestamp_in_entry >= 0:
-                 heapq.heappush(active_conv_finish_times, last_req_timestamp_in_entry)
-                 # print(f"DEBUG: Conv {self.conversation_id} finished. Last req at {last_req_timestamp_in_entry}. Heap size: {len(active_conv_finish_times)}") # Debug
-
+            if last_req_timestamp >= 0: # assume token throughput is 30
+                heapq.heappush(active_conv_finish_times, last_req_timestamp + new_output_len / 30)
             # Increment conversation ID for the next entry
             self.conversation_id += 1
 
@@ -477,6 +482,12 @@ class ShareGPTDataset(BenchmarkDataset):
 
         # Sort all collected samples by their request timestamp
         samples.sort(key=lambda x: x.timestamp)
+        # --- Filter out samples with timestamp ---
+        original_count = len(samples)
+        samples = [s for s in samples if s.timestamp <= time_limit]
+        filtered_count = len(samples)
+        if original_count != filtered_count:
+             print(f"{original_count - filtered_count} samples with timestamp > {time_limit}.")
         return samples
 
 
