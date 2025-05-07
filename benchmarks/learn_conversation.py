@@ -170,7 +170,7 @@ def prepare_dataloaders(
 
 # --- MLP Classifier Definition ---
 class MLPClassifier(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, output_dim=2, num_layers=3, dropout=0.3):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=2, num_layers=4, dropout=0.3):
         super(MLPClassifier, self).__init__()
         layers = []
         current_dim = input_dim
@@ -445,9 +445,9 @@ class MLModel:
 # ==== RUN MODEL ====
 if __name__ == "__main__":
     task_type = "classification"
-    dataset_choice = 'chatbot_arena' #'tay' 'gpt4' #"chatbot_arena" #"sharegpt" # "lmsys-chat-1m"
+    dataset_choice = 'sharegpt' #'tay' 'gpt4' #"chatbot_arena" #"sharegpt" # "lmsys-chat-1m"
 
-    N = -20000
+    N = -100000
     turn_equal_to = 20
     if dataset_choice == "lmsys-chat-1m":
         print("Loading dataset: LMSys-chat-1M from Hugging Face...")
@@ -483,7 +483,7 @@ if __name__ == "__main__":
             train_dataloader=train_loader,
             test_df=test_df, # Pass test_df for evaluation within train
             num_epochs=20,
-            lr=1e-4,
+            lr=5e-5,
             save_dir=checkpoint_dir
         )
     # --- Example: Load Best Model & Use Prediction Methods ---

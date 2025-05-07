@@ -368,15 +368,16 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    last_conversation_id = max(input_requests, key=lambda x: x.conversation_id).conversation_id
+    # last_conversation_id = max(input_requests, key=lambda x: x.conversation_id).conversation_id
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content, conversation_id, turn_id = request.prompt, \
             request.prompt_len, request.expected_output_len, \
                 request.multi_modal_data, request.conversation_id, request.turn_id
-        if last_conversation_id > 0 and conversation_id == last_conversation_id:
-            print("Early termination after seeing the last conversation id: ", last_conversation_id)
-            # skip cool down
-            break
+        #if last_conversation_id > 0 and conversation_id == last_conversation_id:
+        #    print("Early termination after seeing the last conversation id: ", last_conversation_id)
+        #    # Skip cool down, otherwise the hit ratio will be higher at the end
+        #    # This is now handled by time_limit as long as time_limit is the bottleneck
+        #    break
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)

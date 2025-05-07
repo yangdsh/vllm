@@ -353,7 +353,7 @@ class ShareGPTDataset(BenchmarkDataset):
             if self.conv_tag in entry and len(entry[self.conv_tag]) >= 2
         ]
         random.seed(self.random_seed)
-        random.shuffle(self.data)
+        # random.shuffle(self.data)
 
     def sample(self,
                tokenizer: 'PreTrainedTokenizerBase', # Use quotes if class not defined yet
@@ -376,8 +376,10 @@ class ShareGPTDataset(BenchmarkDataset):
 
         for entry_index, entry in enumerate(self.data):
             if len(samples) >= num_requests:
+                print('got enough samples')
                 break
             if last_conv_start_timestamp > time_limit:
+                print('replay timestamp reached limit')
                 break
 
             # --- Calculate potential start time for this new conversation ---
@@ -468,6 +470,8 @@ class ShareGPTDataset(BenchmarkDataset):
                 else:
                     # Condition not met, advance to the next potential start turn
                     i += 1
+                if req_timestamp > time_limit:
+                    break
             # --- End of inner while loop (processing turns for one entry) ---
 
             # If samples were generated for this conversation, record its finish time

@@ -376,7 +376,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
                 if _block_id == block_id and self._refcounter.get(_block_id) == 0:
                     self._cached_blocks.pop(content_hash_to_evict)
                     break
-            print(f"cannot evict: {content_hash_to_evict in self._cached_blocks}")
+            # print(f"cannot evict: {content_hash_to_evict in self._cached_blocks}")
 
         self._refcounter.incr(block_id)
         self._track_block_id(block_id, computed=False)

@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
 
 def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time, debug=False):
-    if prob_has_next == 0:
+    if prob_has_next == 0 or exp_scale == 0:
         return 0.0
     prob_not_accessed_till_now = np.exp(-elapsed_time / exp_scale)
     return (prob_has_next * prob_not_accessed_till_now) / (
