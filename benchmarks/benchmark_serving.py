@@ -300,7 +300,7 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
     )
-
+    '''
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
         raise ValueError(
@@ -308,14 +308,17 @@ async def benchmark(
             f"are correctly specified. Error: {test_output}")
     else:
         print("Initial test run completed. Starting main benchmark run...")
-    while True:
+    '''
+
+    ''' no need to reset cache because server is restarted between every client run
+    for _ in range(2):
+        await asyncio.sleep(10)
         response = requests.post(base_url + "/reset_prefix_cache")
         if response.status_code == 200:
             print("Prefix cache reset successfully.")
-            break
         else:
             print(f"Failed to reset prefix cache. Status code: {response.status_code}")
-        await asyncio.sleep(10)
+    '''
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.

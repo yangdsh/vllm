@@ -159,8 +159,9 @@ class LRUMLEvictor(Evictor):
         block_id = -1
         while block_id not in self.free_table:
             if len(self.to_delete_blocks) > 0:
-                (block_id, content_hash) = self.to_delete_blocks[-1]
-                self.to_delete_blocks = self.to_delete_blocks[:-1]
+                (block_id, content_hash, last_accessed) = self.to_delete_blocks.pop()
+                if block_id not in self.free_table or self.free_table[block_id].last_accessed != last_accessed:
+                    continue
             else:
                 _, (block_id, content_hash) = self.sorted_dict.popitem(0)
         if block_id in self.free_table:
@@ -242,11 +243,11 @@ class LRUMLEvictor(Evictor):
         stat_ = CacheStat()
         # Create a list of (block_id, survival_time) tuples
         survival_list = [
-            (block_id, self.free_table[block_id].cache_hint['id'], -self.free_table[block_id].last_accessed)
+            (block_id, self.free_table[block_id].cache_hint['id'], self.free_table[block_id].last_accessed)
             for block_id in self.free_table
         ]
         # Sort by survival_time in descending order
-        survival_list.sort(key=lambda x: (x[1], x[2]))
+        survival_list.sort(key=lambda x: (x[2], x[1]))
 
         # mark outdated blocks 
         to_delete_cnt = 0
@@ -256,7 +257,7 @@ class LRUMLEvictor(Evictor):
             if self.id_to_last_access[id] == block.last_accessed:
                 continue
             if self.id_to_last_access[id] != block.last_accessed:
-                self.to_delete_blocks.append((block_id, block.content_hash))
+                self.to_delete_blocks.append((block_id, block.content_hash, block.last_accessed))
                 to_delete_cnt += 1
         print("mark outdated blocks cnt: ", to_delete_cnt)
 

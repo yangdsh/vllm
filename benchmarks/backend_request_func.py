@@ -466,6 +466,8 @@ async def async_request_openai_chat_completions(
         # oracle
         if request_func_input.use_oracle > 0:
             prob_has_next = true_label
+            if request_func_input.use_oracle == 3:
+                true_label *= random.random()
             if request_func_input.use_oracle < 1:
                 # with probablity 1 - request_func_input.use_oracle, flip
                 error_rate = (1-request_func_input.use_oracle)
