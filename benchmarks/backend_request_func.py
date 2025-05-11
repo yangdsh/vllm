@@ -378,7 +378,6 @@ async def async_request_openai_chat_completions(
     global n_follow_up
     global predictor_instance
     global start_time
-    global predict_time
     if not predictor_instance and request_func_input.checkpoint:
         predictor_instance = MLModel()
         predictor_instance.load_model(request_func_input.checkpoint)
@@ -460,6 +459,7 @@ async def async_request_openai_chat_completions(
         turns = request_func_input.turn_id
         true_label = (request_func_input.next_timestamp < 1e8)
         if predictor_instance:
+            global predict_time
             predict_start_time = time.time()
             prob_has_next = predictor_instance.predict_single_processed(
                 combine_user_requests(conversation_history[conversation_id]), turns, true_label)
