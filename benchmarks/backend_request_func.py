@@ -365,6 +365,7 @@ conversation_last_time = {}
 n_follow_up = 0
 n_completed_req = 0
 n_running_req = 0
+predict_time = 0
 predictor_instance = None
 start_time = time.time()
 
@@ -377,6 +378,7 @@ async def async_request_openai_chat_completions(
     global n_follow_up
     global predictor_instance
     global start_time
+    global predict_time
     if not predictor_instance and request_func_input.checkpoint:
         predictor_instance = MLModel()
         predictor_instance.load_model(request_func_input.checkpoint)
@@ -402,7 +404,7 @@ async def async_request_openai_chat_completions(
                 return output
         scheduled_time = conversation_last_time[request_func_input.conversation_id] \
             + request_func_input.interval
-        if scheduled_time - start_time > request_func_input.time_limit:
+        if scheduled_time - start_time + request_func_input.output_len / 30 > request_func_input.time_limit:
             output = RequestFuncOutput()
             output.error = "timeout"
             return output
@@ -458,8 +460,10 @@ async def async_request_openai_chat_completions(
         turns = request_func_input.turn_id
         true_label = (request_func_input.next_timestamp < 1e8)
         if predictor_instance:
+            predict_start_time = time.time()
             prob_has_next = predictor_instance.predict_single_processed(
                 combine_user_requests(conversation_history[conversation_id]), turns, true_label)
+            predict_time += time.time() - predict_start_time
             # print(prob_has_next, request_func_input.next_timestamp)
         else:
             prob_has_next = 1
@@ -527,6 +531,8 @@ async def async_request_openai_chat_completions(
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
+        if "prompt_tokens" in payload:
+            output.prompt_len = len(payload["prompt_tokens"])
 
         generated_text = ""
         generated_tokens = []
@@ -598,6 +604,7 @@ async def async_request_openai_chat_completions(
         n_running_req -= 1
         n_completed_req += 1
         if n_completed_req % 100 == 0:
+            print(n_completed_req, '   predict time:', predict_time)
             metrics_url = f"{request_func_input.api_url.replace('v1/chat/completions', '')}metrics"
             response = requests.get(metrics_url)
             for line in response.text.split("\n"):
