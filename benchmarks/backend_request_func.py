@@ -582,7 +582,7 @@ async def async_request_openai_chat_completions(
                     output.generated_text = generated_text
                     end_tokens = request_func_input.tokenizer.encode('<|im_end|>\n')
                     # print("generated: ", generated_text)
-                    if generated_tokens[-2] != end_tokens[-2]:
+                    if len(generated_tokens) <= 1 or generated_tokens[-2] != end_tokens[-2]:
                         generated_tokens += end_tokens
                     update_conversation(request_func_input.conversation_id, generated_text, generated_tokens)
                     output.success = True
@@ -601,6 +601,7 @@ async def async_request_openai_chat_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+            print(output.error)
         n_running_req -= 1
         n_completed_req += 1
         if n_completed_req % 100 == 0:

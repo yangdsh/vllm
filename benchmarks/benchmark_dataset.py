@@ -432,6 +432,13 @@ class ShareGPTDataset(BenchmarkDataset):
 
                 if is_current_user and is_next_not_user:
                     prompt = entry[self.conv_tag][i][self.value_tag]
+                    # ---- microbenchmark controlling hit ratios ----
+                    # the input prompt contains 'hello ' repeated 1000 times, which is 1000 tokens
+                    #prompt += prompt
+                    #prompt = prompt[:1500*6] + str(len(samples)) + prompt[:1000*6] # context and new prompt
+                    #if len(samples) % 10 < 8:
+                    #    prompt = str(len(samples)) + prompt # this prompt is going to miss entirely
+                    # -----------------------------------------------
                     completion = entry[self.conv_tag][i + 1][self.value_tag]
 
                     lora_request, current_tokenizer = self.get_random_lora_request( # Use current_tokenizer
@@ -439,10 +446,13 @@ class ShareGPTDataset(BenchmarkDataset):
                     prompt_ids = current_tokenizer(prompt).input_ids
                     completion_ids = current_tokenizer(completion).input_ids
                     prompt_len = len(prompt_ids)
-                    new_output_len = (len(completion_ids)
-                                    if output_len is None else output_len)
+                    new_output_len = len(completion_ids)
+                    if output_len is not None:
+                        new_output_len += output_len
                     total_output_len += new_output_len
 
+                    if "timestamp" in entry[self.conv_tag][i]:
+                        req_timestamp = conv_timestamp + entry[self.conv_tag][i]["timestamp"] * req_scale
                     # Create and add the sample
                     current_sample = SampleRequest(
                         prompt=prompt,
@@ -459,13 +469,12 @@ class ShareGPTDataset(BenchmarkDataset):
                     turn_id += 1
 
                     # --- Update timestamp for the *next* request *within this conversation* ---
-                    if "timestamp" in entry[self.conv_tag][i]:
-                        req_timestamp = conv_timestamp + entry[self.conv_tag][i]["timestamp"] * req_scale
-                    else:
-                        req_timestamp += np.random.exponential(req_scale)
+                    req_timestamp += np.random.exponential(req_scale)
 
                     # Store the calculated timestamp for the *next* request in the *current* sample
                     if i + 2 < len(entry[self.conv_tag]):
+                        if "timestamp" in entry[self.conv_tag][i+2]:
+                            req_timestamp = conv_timestamp + entry[self.conv_tag][i+2]["timestamp"] * req_scale
                         samples[-1].next_timestamp = req_timestamp
 
                     # Advance index past the processed pair
@@ -485,7 +494,7 @@ class ShareGPTDataset(BenchmarkDataset):
 
         # --- End of outer for loop (processing entries) ---
 
-        print(f"Finished processing {entry_index+1} entries. Generated {len(samples)} samples.")
+        print(f"Finished processing {entry_index+1} entries. Generated {len(samples)} samples.", flush=True)
 
         # Sort all collected samples by their request timestamp
         samples.sort(key=lambda x: x.timestamp)

@@ -197,10 +197,9 @@ class MLPClassifier(nn.Module):
 # --- Main ML Model Class (Refactored) ---
 class MLModel:
     """ ML-based model using Sentence Transformers and MLP classifier. """
-    def __init__(self, bert_model_name: str = "intfloat/multilingual-e5-small", 
-                 #"sentence-transformers/all-MiniLM-L6-v2", 
+    def __init__(self, bert_model_name: str = "intfloat/multilingual-e5-small", #"sentence-transformers/all-MiniLM-L6-v2", # 
                  hidden_dim: int = 128, num_layers: int = 3, 
-                 dropout: float = 0.3, task: str = "classification", 
+                 dropout: float = 0.3, task: str = "classification", train_mode = False,
                  dataset_choice: Optional[str] = None, device: Optional[str] = None ):
         # (Initialization remains the same - no data attributes)
         self.text_to_embedding = {}
@@ -210,14 +209,15 @@ class MLModel:
         if device: self._device = torch.device(device)
         else: self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self._device}")
-        self.bert = SentenceTransformer(bert_model_name, device=str(self._device))
-        self.bert.eval()
-        sentence_embedding_dimension = self.bert.get_sentence_embedding_dimension()
-        self.input_dim = sentence_embedding_dimension + 1
-        self.output_dim = 1 if self.task == "regression" else 2
-        self.classifier = MLPClassifier(input_dim=self.input_dim, hidden_dim=self.hidden_dim, 
-                                        output_dim=self.output_dim, num_layers=self.num_layers, 
-                                        dropout=self.dropout ).to(self._device)
+        if train_mode:
+            self.bert = SentenceTransformer(bert_model_name, device=str(self._device), model_kwargs={'torch_dtype': torch.float16})
+            self.bert.eval()
+            sentence_embedding_dimension = self.bert.get_sentence_embedding_dimension()
+            self.input_dim = sentence_embedding_dimension + 1
+            self.output_dim = 1 if self.task == "regression" else 2
+            self.classifier = MLPClassifier(input_dim=self.input_dim, hidden_dim=self.hidden_dim, 
+                                            output_dim=self.output_dim, num_layers=self.num_layers, 
+                                            dropout=self.dropout ).to(self._device)
         self.y_true = []
         self.y_pred = []
 
@@ -366,12 +366,12 @@ class MLModel:
         # print(preprocessed_text, turns)
 
         # 1. Prepare input tensors
-        input_vals = torch.tensor([[turns]], dtype=torch.float).to(self._device)
+        input_vals = torch.tensor([[turns]] * 1, dtype=torch.float).to(self._device)
 
         # 2. Encode text (already preprocessed)
         with torch.no_grad():
             # Note: Encoding even a single sentence has overhead.
-            embeddings = self.bert.encode([preprocessed_text], convert_to_tensor=True, batch_size=1)
+            embeddings = self.bert.encode([preprocessed_text] * 1, convert_to_tensor=True, batch_size=1)
             if no_embedding:
                 embeddings.zero_()
 
@@ -386,7 +386,7 @@ class MLModel:
             return logits.item()
         else: # Classification
             probabilities = torch.softmax(logits, dim=1)
-            pred_label = torch.argmax(probabilities, dim=1).item() # Label 0 or 1
+            pred_label = torch.argmax(probabilities, dim=1)[0].item() # Label 0 or 1
             if true_label >= 0:
                 self.y_true.append(true_label)
                 self.y_pred.append(pred_label)
@@ -424,10 +424,10 @@ class MLModel:
             self.num_layers = config.get('num_layers', self.num_layers)
             self.dropout = config.get('dropout', self.dropout)
             self.task = config.get('task', self.task)
-            input_dim = config.get('input_dim', self.input_dim)
-            output_dim = config.get('output_dim', self.output_dim)
+            input_dim = config.get('input_dim', 384 + 1)
+            output_dim = config.get('output_dim', 2)
             print(f"Re-initializing BERT with: {self.bert_model_name}")
-            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device))
+            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device), model_kwargs={'torch_dtype': torch.float16})
             self.bert.eval()
             print(f"Re-initializing Classifier with HParams: \
                   hidden={self.hidden_dim}, layers={self.num_layers}, dropout={self.dropout}")
@@ -445,9 +445,9 @@ class MLModel:
 # ==== RUN MODEL ====
 if __name__ == "__main__":
     task_type = "classification"
-    dataset_choice = 'sharegpt' #'tay' 'gpt4' #"chatbot_arena" #"sharegpt" # "lmsys-chat-1m"
+    dataset_choice = 'lmsys-chat-1m' #'tay' 'gpt4' #"chatbot_arena" #"sharegpt" # "lmsys-chat-1m"
 
-    N = -100000
+    N = 10000
     turn_equal_to = 20
     if dataset_choice == "lmsys-chat-1m":
         print("Loading dataset: LMSys-chat-1M from Hugging Face...")
@@ -470,10 +470,10 @@ if __name__ == "__main__":
     else:
         print('dataset not found')
     train_loader, test_loader, test_df = prepare_dataloaders( # Get test_df back
-        df=df, task=task_type, batch_size=256, test_size=0.01
+        df=df, task=task_type, batch_size=256, test_size=0.002
     )
     # --- Initialize Model ---
-    mlmodel = MLModel(task=task_type, dataset_choice=dataset_choice)
+    mlmodel = MLModel(task=task_type, dataset_choice=dataset_choice, train_mode=True)
 
     # --- Train Model (passing train_loader and test_df) ---
     checkpoint_dir = f"checkpoints_{dataset_choice}_{turn_equal_to}"
@@ -487,32 +487,32 @@ if __name__ == "__main__":
             save_dir=checkpoint_dir
         )
     # --- Example: Load Best Model & Use Prediction Methods ---
-    try:
-        saved_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
-        saved_files.sort(reverse=True)
-        best_checkpoint_path = os.path.join(checkpoint_dir, saved_files[0])
-        print(f"\n--- Loading Best Checkpoint: {best_checkpoint_path} ---")
-        # Re-initialize or use existing model instance and load weights
-        # We need to ensure HParams match if re-initializing without config in checkpoint
-        mlmodel_loaded = MLModel(task=task_type, dataset_choice=dataset_choice)
-        mlmodel_loaded.load_model(best_checkpoint_path) # load_model sets to eval()
+    
+    saved_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
+    saved_files.sort(reverse=True)
+    best_checkpoint_path = os.path.join(checkpoint_dir, saved_files[0])
+    print(f"\n--- Loading Best Checkpoint: {best_checkpoint_path} ---")
+    # Re-initialize or use existing model instance and load weights
+    # We need to ensure HParams match if re-initializing without config in checkpoint
+    mlmodel_loaded = MLModel(task=task_type, dataset_choice=dataset_choice)
+    mlmodel_loaded.load_model(best_checkpoint_path) # load_model sets to eval()
 
-        # --- sanity check for online prediction ---
-        print("\n--- Example: Single Prediction (using loaded model) ---")
-        sum_true_label = 0
-        for i in range(1000):
-            if i >= len(test_df):
-                break
-            example_row = test_df.iloc[i]
-            example_text = example_row['text']
-            example_turns = example_row['turns']
-            true_label_example = example_row['follow_up']
-            sum_true_label += true_label_example
+    # --- sanity check for online prediction ---
+    print("\n--- Example: Single Prediction (using loaded model) ---")
+    sum_true_label = 0
+    start_time = time.time()
+    for i in range(1000):
+        if i >= len(test_df):
+            break
+        example_row = test_df.iloc[i]
+        example_text = example_row['text']
+        example_turns = example_row['turns']
+        true_label_example = example_row['follow_up']
+        sum_true_label += true_label_example
 
-            prob = mlmodel_loaded.predict_single_processed(example_text, example_turns, true_label_example)
-            #if i < 20:
-            #    print(f"Input Text: '{example_text[:100]}...' (Turns={example_turns})")
-            #    print(f"True Label: {true_label_example}, Prob(Follow-up): {prob:.4f}")
-        print("has follow up: ", sum_true_label, "/", len(test_df))
-    except IndexError: print(f"\nNo checkpoints found in '{checkpoint_dir}'.")
-    except Exception as e: print(f"\nError during loading/prediction example: {e}")
+        prob = mlmodel_loaded.predict_single_processed(example_text, example_turns, true_label_example)
+        #if i < 20:
+        #    print(f"Input Text: '{example_text[:100]}...' (Turns={example_turns})")
+        #    print(f"True Label: {true_label_example}, Prob(Follow-up): {prob:.4f}")
+    print("has follow up: ", sum_true_label, "/", len(test_df))
+    print("per prediction time: ", (time.time() - start_time) / len(test_df))

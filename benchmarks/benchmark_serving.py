@@ -310,15 +310,12 @@ async def benchmark(
         print("Initial test run completed. Starting main benchmark run...")
     '''
 
-    ''' no need to reset cache because server is restarted between every client run
-    for _ in range(2):
-        await asyncio.sleep(10)
-        response = requests.post(base_url + "/reset_prefix_cache")
-        if response.status_code == 200:
-            print("Prefix cache reset successfully.")
-        else:
-            print(f"Failed to reset prefix cache. Status code: {response.status_code}")
-    '''
+    # actually no need to reset cache because server is restarted between every client run
+    response = requests.post(base_url + "/reset_prefix_cache")
+    if response.status_code == 200:
+        print("Prefix cache reset successfully.")
+    else:
+        print(f"Failed to reset prefix cache. Status code: {response.status_code}")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.

@@ -1089,7 +1089,7 @@ class CacheConfig:
         num_gpu_blocks_override: Optional[int] = None,
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
-        eviction_algorithm: str = 'lru',
+        eviction_algorithm: str = 'ml',
         eviction_algorithm_config: str = '',
         cpu_offload_gb: float = 0,
         calculate_kv_scales: Optional[bool] = None,
