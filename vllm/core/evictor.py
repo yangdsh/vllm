@@ -273,7 +273,7 @@ class LRUMLEvictor(Evictor):
             cnt += 1
             if cnt > 10:
                 break
-            print(block.cache_hint, block.score, block.last_accessed)
+            print(block.cache_hint['true_tta'], block.score, block.last_accessed)
 
         for block_id in self.free_table:
             survival_time = time.time() - self.free_table[block_id].last_accessed

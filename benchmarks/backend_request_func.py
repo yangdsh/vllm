@@ -20,7 +20,7 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 
 from vllm.model_executor.model_loader.weight_utils import get_lock
 
-from learn_conversation import MLModel, combine_user_requests
+from vllm.core.learn_conversation import combine_user_requests
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -366,7 +366,6 @@ n_follow_up = 0
 n_completed_req = 0
 n_running_req = 0
 predict_time = 0
-predictor_instance = None
 start_time = time.time()
 
 async def async_request_openai_chat_completions(
@@ -376,11 +375,6 @@ async def async_request_openai_chat_completions(
     global n_running_req
     global n_completed_req
     global n_follow_up
-    global predictor_instance
-    global start_time
-    if not predictor_instance and request_func_input.checkpoint:
-        predictor_instance = MLModel()
-        predictor_instance.load_model(request_func_input.checkpoint)
     api_url = request_func_input.api_url
     assert api_url.endswith(
         "chat/completions"
@@ -458,14 +452,8 @@ async def async_request_openai_chat_completions(
         conversation_id = request_func_input.conversation_id
         turns = request_func_input.turn_id
         true_label = (request_func_input.next_timestamp < 1e8)
-        if predictor_instance:
-            global predict_time
-            predict_start_time = time.time()
-            prob_has_next = predictor_instance.predict_single_processed(
-                combine_user_requests(conversation_history[conversation_id]), turns, true_label)
-            predict_time += time.time() - predict_start_time
-            # print(prob_has_next, request_func_input.next_timestamp)
-        else:
+        prob_has_next = -1
+        if request_func_input.use_lru:
             prob_has_next = 1
         # oracle
         if request_func_input.use_oracle > 0:
@@ -482,11 +470,14 @@ async def async_request_openai_chat_completions(
                     prob_has_next = prob_has_next * (1- uncertainty * 2) + uncertainty
 
         hint = {"turns": turns,
-                "prob_has_next": prob_has_next,
+                "conversation_input": combine_user_requests(conversation_history[conversation_id]),
                 "exp_scale": request_func_input.exp_scale,
                 "true_tta": request_func_input.next_timestamp - request_func_input.timestamp,
                 "id": conversation_id,
-                }
+                "checkpoint": request_func_input.checkpoint,
+        }
+        if prob_has_next != -1:
+            hint["prob_has_next"] = prob_has_next
         if request_func_input.use_oracle == 2:
             hint["next_timestamp"] = request_func_input.next_timestamp
         if request_func_input.use_lru:

@@ -6,6 +6,11 @@ from bisect import bisect_left
 from os.path import commonprefix
 from typing import (Callable, Dict, FrozenSet, Iterable, List, Optional, Set,
                     Tuple)
+import queue
+import threading
+import time
+
+from vllm.core.learn_conversation import MLModel
 
 from vllm.core.block.common import (CacheMetricData, CopyOnWriteTracker,
                                     get_all_blocks_recursively)
@@ -27,6 +32,9 @@ _DEFAULT_LAST_ACCESSED_TIME = -1
 logger = init_logger(__name__)
 
 DEBUG_CACHE = 0
+
+# Global queues for prediction
+to_predict_queue = queue.Queue()
 
 class BlockTracker:
     """Used to track the status of a block inside the prefix caching allocator
@@ -149,6 +157,10 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         self.eviction_algorithm = eviction_algorithm
         self.eviction_algorithm_config = eviction_algorithm_config
         self.evictor: Evictor = make_evictor(eviction_algorithm, eviction_algorithm_config)
+        if eviction_algorithm != 'lru':
+            # Start the worker thread
+            self.t_predictor_thread = threading.Thread(target=self.predictor_worker, daemon=True)
+            self.t_predictor_thread.start()
 
         # We share the refcounter between allocators. This allows us to promote
         # blocks originally allocated in the hashless allocator to immutable
@@ -159,6 +171,27 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             refcounter=self._refcounter.as_readonly())
 
         self.metric_data = CacheMetricData()
+
+    def predictor_worker(self):
+        predictor_cache = {}
+        print("Predictor worker started")
+        while True:
+            cache_hint = to_predict_queue.get()
+            if cache_hint is None:
+                print("Predictor worker exiting")
+                break
+            checkpoint = cache_hint["checkpoint"]
+            if checkpoint not in predictor_cache:
+                predictor = MLModel()
+                predictor.load_model(checkpoint)
+                predictor_cache[checkpoint] = predictor
+            else:
+                predictor = predictor_cache[checkpoint]
+            # print('predicting:', cache_hint["conversation_input"])
+            prob = predictor.predict_single_processed(
+                cache_hint["conversation_input"], cache_hint["turns"])
+            cache_hint["prob_has_next"] = prob
+            to_predict_queue.task_done()
 
     def _create_block(
         self,
@@ -1154,14 +1187,17 @@ class LastAccessBlocksTracker:
         """
         assert seq_id not in self._seq_last_access
         self._seq_last_access[seq_id] = None
-        self._seq_cache_hint[seq_id] = {}
+        self._seq_cache_hint[seq_id] = None
+        if DEBUG_CACHE:
+            print('add: ', seq_id)
 
     def remove_seq(self, seq_id: int) -> None:
         """Stop tracking seq_id
         """
         assert seq_id in self._seq_last_access
         del self._seq_last_access[seq_id]
-        # print('remove: ', seq_id, self._seq_cache_hint[seq_id])
+        if DEBUG_CACHE:
+            print('remove: ', seq_id, self._seq_cache_hint[seq_id])
         del self._seq_cache_hint[seq_id]
 
     def update_last_access(self, seq_id: int, time: float) -> None:
@@ -1169,23 +1205,27 @@ class LastAccessBlocksTracker:
         self._seq_last_access[seq_id] = time
 
     def update_cache_hint(self, seq_id: int, cache_hint: dict) -> None:    
-        if seq_id not in self._seq_cache_hint[seq_id]:
+        cache_hint['seq_id'] = seq_id
+        if seq_id not in self._seq_cache_hint or self._seq_cache_hint[seq_id] == None:
             self._seq_cache_hint[seq_id] = cache_hint
+            if 'prob_has_next' not in cache_hint:
+                to_predict_queue.put(cache_hint)
         else:
             if self._seq_cache_hint[seq_id]['turns'] < cache_hint['turns']:
                 self._seq_cache_hint[seq_id] = cache_hint
+                if 'prob_has_next' not in cache_hint:
+                    to_predict_queue.put(cache_hint)
 
-    def update_blocks_metadata_using_seq_metadata(self, seq_id: int,
-                                      block_ids: List[int]) -> None:
-        assert seq_id in self._seq_last_access
-
+    def update_blocks_metadata_using_seq_metadata(self, seq_id: int, block_ids: List[int]) -> None:
+        # Block until the predicted cache_hint for this seq_id is available
+        if 'prob_has_next' not in self._seq_cache_hint[seq_id]:
+            print('skip prediction for seq_id', seq_id)
+            self._seq_cache_hint[seq_id]['prob_has_next'] = 0
         ts = self._seq_last_access[seq_id]
-        cache_hint = self._seq_cache_hint[seq_id]
-
         if ts is None:
-            # No last access was recorded, no need to update.
             return
-        self._allocator.mark_blocks_as_accessed(block_ids, ts, cache_hint)
+        # print('Mark_blocks with cache hint: ', self._seq_cache_hint[seq_id])
+        self._allocator.mark_blocks_as_accessed(block_ids, ts, self._seq_cache_hint[seq_id])
 
 
 def assert_prefix_caching_block_or_none(block: Optional[Block]):
