@@ -365,7 +365,6 @@ conversation_last_time = {}
 n_follow_up = 0
 n_completed_req = 0
 n_running_req = 0
-predict_time = 0
 start_time = time.time()
 
 async def async_request_openai_chat_completions(
@@ -596,7 +595,6 @@ async def async_request_openai_chat_completions(
         n_running_req -= 1
         n_completed_req += 1
         if n_completed_req % 100 == 0:
-            print(n_completed_req, '   predict time:', predict_time)
             metrics_url = f"{request_func_input.api_url.replace('v1/chat/completions', '')}metrics"
             response = requests.get(metrics_url)
             for line in response.text.split("\n"):

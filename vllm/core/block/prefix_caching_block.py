@@ -1221,6 +1221,10 @@ class LastAccessBlocksTracker:
         if 'prob_has_next' not in self._seq_cache_hint[seq_id]:
             print('skip prediction for seq_id', seq_id)
             self._seq_cache_hint[seq_id]['prob_has_next'] = 0
+        # ---------------------------------------------
+        # ablation study
+        # self._seq_cache_hint[seq_id]['prob_has_next'] = 1
+        # ---------------------------------------------
         ts = self._seq_last_access[seq_id]
         if ts is None:
             return
