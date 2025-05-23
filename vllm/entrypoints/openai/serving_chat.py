@@ -39,7 +39,6 @@ from vllm.transformers_utils.tokenizers import (maybe_serialize_tool_calls,
                                                 truncate_tool_call_ids)
 
 logger = init_logger(__name__)
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
 
 
 class OpenAIServingChat(OpenAIServing):

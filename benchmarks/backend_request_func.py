@@ -4,6 +4,7 @@ import json
 import os
 import random
 import sys
+import math
 import time
 import traceback
 from collections import defaultdict
@@ -458,7 +459,8 @@ async def async_request_openai_chat_completions(
         if request_func_input.use_oracle > 0:
             prob_has_next = true_label
             if request_func_input.use_oracle == 3:
-                true_label *= random.random()
+                prob_has_next *= random.random() * 0.9
+                # math.exp(-request_func_input.next_timestamp / request_func_input.exp_scale)
             if request_func_input.use_oracle < 1:
                 # with probablity 1 - request_func_input.use_oracle, flip
                 error_rate = (1-request_func_input.use_oracle)
