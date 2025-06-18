@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A block manager that manages token blocks."""
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from typing import Sequence as GenericSequence
-from typing import Tuple
 
 from vllm.core.block.block_table import BlockTable
 from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
@@ -11,12 +10,22 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.core.learn_conversation import MLModel
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
+
+import time
+import os
+import queue
+import threading
+import heapq
+import json
 
 SeqId = int
 EncoderSeqId = str
 
+# Debug flag for print statements
+ENABLE_DEBUG_PRINTS = False
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
     """BlockSpaceManager which manages the allocation of KV cache.
@@ -72,6 +81,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+        if eviction_algorithm_config:
+            self.eviction_algorithm_config = json.loads(eviction_algorithm_config)
+        else:
+            self.eviction_algorithm_config = {}
+        self.enable_online_learning = self.eviction_algorithm_config.get("enable_online_learning", False)
 
         self.sliding_window = sliding_window
         # max_block_sliding_window is the max number of blocks that need to be
@@ -109,6 +123,109 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator, self.block_size, self.enable_caching)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
+
+        # === Online Learning Integration ===
+        if self.enable_online_learning:
+            self._online_learning_setup()
+
+    def _online_learning_setup(self):
+        """Initializes components for online model training."""
+        self.training_queue = queue.Queue()
+        self.training_batch_size = 32
+        self.conversation_timeout = 30  # 0.5 minutes
+        self.warmup_finished_time = time.time() + self.conversation_timeout
+        
+        # Track conversations, not individual sequences
+        self.active_conversations: Dict[str, Dict] = {}  # conv_id -> data
+        self.conv_heap: List[Tuple[float, str]] = []  # (last_accessed, conv_id)
+        self.pending_batch: List[Dict] = []
+        self._conv_lock = threading.Lock()
+
+        model_path = "checkpoints_lmsys-chat-1m_20/lmsys-chat-1m_epoch20_metric_neg0_0036.pt"
+        if os.path.exists(model_path):
+            if ENABLE_DEBUG_PRINTS:
+                print(f"Loading existing model for online learning from {model_path}")
+            self.ml_model = MLModel(task="classification", train_mode=False)
+            self.ml_model.load_model(model_path)
+        else:
+            if ENABLE_DEBUG_PRINTS:
+                print(f"Warning: Model path not found. Initializing new model for online learning.")
+            self.ml_model = MLModel(task="classification", train_mode=True)
+
+        self._stop_event = threading.Event()
+        self._training_thread = threading.Thread(target=self._training_worker_loop, daemon=True)
+        self._training_thread.start()
+        if ENABLE_DEBUG_PRINTS:
+            print("Online learning worker thread started.")
+            print(f"Training is frozen for a {self.conversation_timeout}s warmup period.")
+
+    def __del__(self):
+        if hasattr(self, "_stop_event"):
+            self._stop_event.set()
+        if hasattr(self, '_training_thread') and self._training_thread.is_alive():
+             self._training_thread.join()
+
+    def _training_worker_loop(self):
+        """Worker thread to process training samples and generate balanced batches."""
+        TRAINING_INTERVAL = 10 # seconds
+
+        while not self._stop_event.is_set():
+            if ENABLE_DEBUG_PRINTS:
+                print(f"[DEBUG] Training worker loop iteration. Sleeping for {TRAINING_INTERVAL}s.")
+            time.sleep(TRAINING_INTERVAL)
+
+            # Do not start training until the warmup period is over.
+            if time.time() < self.warmup_finished_time:
+                if ENABLE_DEBUG_PRINTS:
+                    print(f"[DEBUG] Warmup period active. {int(self.warmup_finished_time - time.time())}s remaining.")
+                continue
+
+            batch = self.pending_batch
+            
+            # 1. Drain all positive samples from the queue
+            num_pos_samples = 0
+            while not self.training_queue.empty():
+                try:
+                    positive_sample = self.training_queue.get_nowait()
+                    batch.append(positive_sample)
+                    num_pos_samples += 1
+                    self.training_queue.task_done()
+                except queue.Empty:
+                    break
+            if ENABLE_DEBUG_PRINTS:
+                print(f"[DEBUG] Drained {num_pos_samples} positive samples from the queue.")
+
+            # 2. Generate all available negative samples
+            self._generate_all_available_timeout_samples(batch)
+
+            # 3. If we have a large enough batch, train on it. Otherwise, hold it.
+            if ENABLE_DEBUG_PRINTS:
+                print(f"[DEBUG] Current batch size: {len(batch)}")
+            if len(batch) >= self.training_batch_size:
+                if ENABLE_DEBUG_PRINTS:
+                    print(f"[DEBUG] Training on batch of size {len(batch)}")
+                self.ml_model.train_step(batch)
+                batch.clear()
+                if ENABLE_DEBUG_PRINTS:
+                    print("[DEBUG] Training complete. Batch cleared.")
+
+    def _generate_all_available_timeout_samples(self, batch: List[Dict]):
+        """Generate negative samples from all conversations that have timed out."""
+        now = time.time()
+        with self._conv_lock:
+            # Process all conversations that have timed out
+            while self.conv_heap and self.conv_heap[0][0] + self.conversation_timeout < now:
+                _, conv_id = heapq.heappop(self.conv_heap)
+                if conv_id in self.active_conversations:
+                    conv_data = self.active_conversations.pop(conv_id)
+                    if self.enable_online_learning:
+                        if ENABLE_DEBUG_PRINTS:
+                            print(f"[DEBUG] Generating negative sample from timed out conversation {conv_id}")
+                    batch.append({
+                        'conv_id': conv_id,
+                        'label': 0,  # Negative sample
+                        'data': conv_data
+                    })
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -189,6 +306,37 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # Track seq
             self._last_access_blocks_tracker.add_seq(seq.seq_id)
 
+        # --- Online Learning: Track new conversations and generate positive samples ---
+        if self.enable_online_learning and waiting_seqs:
+            first_seq = waiting_seqs[0]
+            if first_seq.cache_hint and 'id' in first_seq.cache_hint:
+                conv_id = first_seq.cache_hint['id']
+                text = first_seq.cache_hint.get("conversation_input", "")
+                turns = first_seq.cache_hint.get("turns", 0)
+
+                with self._conv_lock:
+                    now = time.time()
+                    self.active_conversations[conv_id] = {
+                        "text": text,
+                        "turns": turns,
+                        "last_accessed": now,
+                    }
+                    heapq.heappush(self.conv_heap, (now, conv_id))
+                    
+                if ENABLE_DEBUG_PRINTS:
+                    print(f"[DEBUG] Tracking conversation for online learning: {conv_id}")
+
+                # Generate a positive sample if this is a follow-up turn
+                if turns > 0:
+                    positive_sample = {
+                        "text": text,
+                        "turns": turns,
+                        "follow_up": 1
+                    }
+                    if ENABLE_DEBUG_PRINTS:
+                        print(f"Generated positive sample for conv_id: {conv_id} (turns={turns})")
+                    self.training_queue.put(positive_sample)
+
         # Allocate cross-attention block table for encoder sequence
         #
         # NOTE: Here we assume that all sequences in the group have the same
@@ -248,27 +396,38 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             token_ids=block_table.get_unseen_token_ids(seq.get_token_ids()),
             num_lookahead_slots=num_lookahead_slots,
             num_computed_slots=seq.data.get_num_computed_tokens(),
-            extra_hash=seq.extra_hash(),
-        )
+            extra_hash=seq.extra_hash())
         # Return any new copy-on-writes.
         new_cows = self.block_allocator.clear_copy_on_writes()
         return new_cows
 
     def free(self, seq: Sequence) -> None:
-        seq_id = seq.seq_id
-        if seq_id not in self.block_tables:
-            # Already freed or haven't been scheduled yet.
+        """Frees the memory blocks of a sequence."""
+        if seq.seq_id not in self.block_tables:
+            # The sequence has already been freed.
             return
 
-        # Update seq block ids with the latest access time
-        self._last_access_blocks_tracker.update_blocks_metadata_using_seq_metadata(
-            seq_id, self.block_tables[seq.seq_id].physical_block_ids)
+        # --- Online Learning: Update conversation state on free ---
+        if self.enable_online_learning:
+            with self._conv_lock:
+                if seq.cache_hint and 'id' in seq.cache_hint:
+                    conv_id = seq.cache_hint['id']
+                    if conv_id in self.active_conversations:
+                        # Update the last_accessed time as this request is ending.
+                        now = time.time()
+                        self.active_conversations[conv_id]['last_accessed'] = now
+                        heapq.heappush(self.conv_heap, (now, conv_id))
 
-        # Free table/blocks
-        self.block_tables[seq_id].free()
-        del self.block_tables[seq_id]
-        self._last_access_blocks_tracker.remove_seq(seq_id)
-        self._computed_blocks_tracker.remove_seq(seq_id)
+        # Propagate sequence-level metadata to the block-level.
+        # This is required for the evictor to have the correct cache hints.
+        self._last_access_blocks_tracker.update_blocks_metadata_using_seq_metadata(
+            seq.seq_id, self.block_tables[seq.seq_id].physical_block_ids)
+
+        block_table = self.block_tables.pop(seq.seq_id)
+        block_table.free()
+
+        self._last_access_blocks_tracker.remove_seq(seq.seq_id)
+        self._computed_blocks_tracker.remove_seq(seq.seq_id)
 
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id
@@ -361,41 +520,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                               num_lookahead_slots)
 
     def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
-        """Returns the block id mapping (from CPU to GPU) generated by
-        swapping in the given seq_group with num_lookahead_slots.
-
-        Args:
-            seq_group (SequenceGroup): The sequence group to swap in.
-
-        Returns:
-            List[Tuple[int, int]]: The mapping of swapping block from CPU 
-                to GPU.
-        """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
-                continue
-
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.CPU,
-                                                         dst_device=Device.GPU)
-
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
-
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id)
-                for cpu_block_id, gpu_block_id in seq_swap_mapping.items()
-            }
-
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
-
-        return physical_block_id_mapping
+        return self._swap(seq_group, Device.CPU, Device.GPU)
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         """Returns whether we can swap out the given sequence_group 
@@ -424,31 +549,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             List[Tuple[int, int]]: The mapping of swapping block from 
                 GPU to CPU.
         """
-        physical_block_id_mapping = []
-        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
-            blocks = self.block_tables[seq.seq_id].blocks
-            if len(blocks) == 0:
-                continue
-
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
-                                                         src_device=Device.GPU,
-                                                         dst_device=Device.CPU)
-
-            # Refresh the block ids of the table (post-swap)
-            self.block_tables[seq.seq_id].update(blocks)
-
-            seq_physical_block_id_mapping = {
-                self.block_allocator.get_physical_block_id(
-                    Device.GPU, gpu_block_id):
-                self.block_allocator.get_physical_block_id(
-                    Device.CPU, cpu_block_id)
-                for gpu_block_id, cpu_block_id in seq_swap_mapping.items()
-            }
-
-            physical_block_id_mapping.extend(
-                list(seq_physical_block_id_mapping.items()))
-
-        return physical_block_id_mapping
+        return self._swap(seq_group, Device.GPU, Device.CPU)
 
     def get_num_free_gpu_blocks(self) -> int:
         return self.block_allocator.get_num_free_blocks(Device.GPU)
@@ -521,3 +622,45 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         cached in the block manager for the sequence.
         """
         return self._computed_blocks_tracker.get_num_cached_tokens(seq)
+
+    def _swap(self,
+              seq_group: SequenceGroup,
+              src_device: Device,
+              dst_device: Device) -> List[Tuple[int, int]]:
+        """Returns the block id mapping (from src_device to dst_device) generated by
+        swapping the given sequence_group.
+
+        Args:
+            sequence_group (SequenceGroup): The sequence group to swap.
+            src_device (Device): The source device to swap from.
+            dst_device (Device): The destination device to swap to.
+
+        Returns:
+            List[Tuple[int, int]]: The mapping of swapping block from 
+                src_device to dst_device.
+        """
+        physical_block_id_mapping = []
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+            blocks = self.block_tables[seq.seq_id].blocks
+            if len(blocks) == 0:
+                continue
+
+            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
+                                                         src_device=src_device,
+                                                         dst_device=dst_device)
+
+            # Refresh the block ids of the table (post-swap)
+            self.block_tables[seq.seq_id].update(blocks)
+
+            seq_physical_block_id_mapping = {
+                self.block_allocator.get_physical_block_id(
+                    src_device, cpu_block_id):
+                self.block_allocator.get_physical_block_id(
+                    dst_device, gpu_block_id)
+                for cpu_block_id, gpu_block_id in seq_swap_mapping.items()
+            }
+
+            physical_block_id_mapping.extend(
+                list(seq_physical_block_id_mapping.items()))
+
+        return physical_block_id_mapping

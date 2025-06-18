@@ -483,7 +483,7 @@ class EngineArgs:
         parser.add_argument(
             "--eviction-algorithm",
             type=str,
-            default='ml',
+            default='lru',
             help="Eviction algorithm for prefix caching. "
         )
         parser.add_argument(

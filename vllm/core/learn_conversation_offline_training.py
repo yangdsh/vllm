@@ -349,50 +349,6 @@ class MLModel:
         self.classifier.eval()
 
 
-    def train_online(self, samples: List[Dict[str, Any]], lr: float = 2e-5):
-        """
-        Performs online training on a small batch of new samples.
-        """
-        if not hasattr(self, 'optimizer'):
-            self.optimizer = Adam(self.classifier.parameters(), lr=lr)
-        
-        self.classifier.train()
-        criterion = nn.CrossEntropyLoss() if self.task == "classification" else nn.MSELoss()
-
-        # Convert samples to a DataFrame and DataLoader
-        df = pd.DataFrame(samples)
-        dataset = ConversationTurnDataset(df, task=self.task)
-        dataloader = DataLoader(dataset, shuffle=True, batch_size=len(samples))
-
-        for batch in dataloader:
-            try:
-                input_texts, input_vals, labels = batch
-            except ValueError:
-                print(f"Skipping malformed online batch"); continue
-
-            labels = labels.to(self._device)
-            input_vals = input_vals.to(self._device).float().unsqueeze(1)
-            if self.task == 'regression':
-                labels = labels.float().unsqueeze(1)
-            else:
-                labels = labels.long()
-
-            with torch.no_grad():
-                embeddings = self.bert.encode(list(input_texts), convert_to_tensor=True,
-                                              batch_size=len(input_texts))
-            
-            combined_features = torch.cat((embeddings, input_vals), dim=1)
-            logits = self.classifier(combined_features)
-            loss = criterion(logits, labels)
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            print(f"Online training step finished. Loss: {loss.item():.4f}")
-
-        self.classifier.eval()
-
-
     def predict_single_processed(
         self,
         preprocessed_text: str, # Takes preprocessed text now

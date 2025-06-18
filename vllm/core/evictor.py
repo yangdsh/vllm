@@ -2,6 +2,7 @@
 
 import enum
 import heapq
+import json
 import time
 import statistics
 import numpy as np
@@ -139,7 +140,7 @@ class LRUMLEvictor(Evictor):
     def parse_str_to_dict(self, s: str) -> dict:
         if len(s) == 0:
             return {}
-        return {key: value for key, value in (pair.split("=", 1) for pair in s.split(","))}
+        return json.loads(s)
 
     def calc_score(self, block_id, last_accessed, cache_hint):
         if 'use_lru' in cache_hint and cache_hint['use_lru']:
