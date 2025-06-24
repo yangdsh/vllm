@@ -387,9 +387,9 @@ async def async_request_openai_chat_completions(
         return output
     # wait until all previous turns are finished
     cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
-    if cur_turn_id > 0:
-        while cur_turn_id != request_func_input.turn_id \
-                and request_func_input.turn_id >= 0:
+    if request_func_input.turn_id > 0:
+        while cur_turn_id != request_func_input.turn_id:
+            cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
             await asyncio.sleep(3)
             if time.time() - start_time > request_func_input.time_limit:
                 output = RequestFuncOutput()
@@ -601,6 +601,8 @@ async def async_request_openai_chat_completions(
             response = requests.get(metrics_url)
             for line in response.text.split("\n"):
                 if "gpu_prefix_cache_hit_rate{" in line:
+                    print(line)
+                if "vllm:prompt_tokens_total{" in line:
                     print(line)
 
     if pbar:
