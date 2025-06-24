@@ -128,9 +128,6 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.online_learning_manager = OnlineLearningManager(
             eviction_algorithm_config=eviction_algorithm_config)
 
-    def __del__(self):
-        self.online_learning_manager.stop_worker()
-
     def can_allocate(self,
                      seq_group: SequenceGroup,
                      num_lookahead_slots: int = 0) -> AllocStatus:

@@ -6,15 +6,13 @@ import torch.nn as nn
 import time
 import sys
 sys.setrecursionlimit(15000)
-import math
 from torch.optim import Adam
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
-from collections import Counter
 from datasets import load_dataset
-from sklearn.metrics import mean_squared_error, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import mean_squared_error, precision_score, recall_score, f1_score
 from typing import List, Tuple, Dict, Any, Optional, Union
 
 
@@ -197,20 +195,33 @@ class MLPClassifier(nn.Module):
 # --- Main ML Model Class (Refactored) ---
 class MLModel:
     """ ML-based model using Sentence Transformers and MLP classifier. """
-    def __init__(self, bert_model_name: str = "intfloat/multilingual-e5-small", #"sentence-transformers/all-MiniLM-L6-v2", # 
+    def __init__(self, 
+                 bert_model_name: str = "intfloat/multilingual-e5-small", 
+                 #"sentence-transformers/all-MiniLM-L6-v2", # 
                  hidden_dim: int = 128, num_layers: int = 3, 
                  dropout: float = 0.3, task: str = "classification", train_mode = False,
                  dataset_choice: Optional[str] = None, device: Optional[str] = None ):
         # (Initialization remains the same - no data attributes)
         self.text_to_embedding = {}
-        self.bert_model_name = bert_model_name; self.hidden_dim = hidden_dim
-        self.num_layers = num_layers; self.dropout = dropout
-        self.task = task; self.dataset_choice = dataset_choice
-        if device: self._device = torch.device(device)
-        else: self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.bert_model_name = bert_model_name
+        if self.bert_model_name == "intfloat/multilingual-e5-small":
+            offline_bert_path = ("/scratch/gpfs/dy5/.cache/huggingface/hub/models--intfloat--multilingual-e5-small"
+                       "/snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846")
+            if os.path.exists(offline_bert_path):
+                self.bert_model_name = offline_bert_path
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.task = task
+        self.dataset_choice = dataset_choice
+        if device:
+            self._device = torch.device(device)
+        else: 
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self._device}")
         if train_mode:
-            self.bert = SentenceTransformer(bert_model_name, device=str(self._device), model_kwargs={'torch_dtype': torch.float16})
+            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device), 
+                                            model_kwargs={'torch_dtype': torch.float16})
             self.bert.eval()
             sentence_embedding_dimension = self.bert.get_sentence_embedding_dimension()
             self.input_dim = sentence_embedding_dimension + 1
@@ -297,7 +308,8 @@ class MLModel:
                 if self.task == "classification":
                     logit = self.predict_single_processed(preprocessed_text, turns,
                                                          no_embedding=no_embedding, return_prob=False)
-                    loss = criterion(logit, torch.tensor(true_label, dtype=torch.long).unsqueeze(0).to(self._device))
+                    loss = criterion(logit, torch.tensor(true_label, 
+                                                         dtype=torch.long).unsqueeze(0).to(self._device))
                     test_loss_sum += loss.item()
                     prob = torch.softmax(logit, dim=1)[0, 1].item()
                     pred_label = 1 if prob > 0.5 else 0 # Simple thresholding
@@ -444,18 +456,27 @@ class MLModel:
                 return logits
 
     def save_model(self, save_path: str):
-        save_content = {'model_state_dict': self.classifier.state_dict(), 
-                        'config': {'bert_model_name': self.bert_model_name, 
-                                   'hidden_dim': self.hidden_dim, 
-                                   'num_layers': self.num_layers, 
-                                   'dropout': self.dropout, 
-                                   'task': self.task, 
-                                   'input_dim': self.input_dim, 
+        # Atomic save using a temporary file and rename
+        temp_path = save_path + f".tmp.{os.getpid()}"
+        save_content = {'model_state_dict': self.classifier.state_dict(),
+                        'config': {'bert_model_name': self.bert_model_name,
+                                   'hidden_dim': self.hidden_dim,
+                                   'num_layers': self.num_layers,
+                                   'dropout': self.dropout,
+                                   'task': self.task,
+                                   'input_dim': self.input_dim,
                                    'output_dim': self.output_dim,
-                                   } 
+                                   }
                         }
-        torch.save(save_content, save_path)
-        print(f"Saved to {save_path}")
+        try:
+            torch.save(save_content, temp_path)
+            os.rename(temp_path, save_path)
+            print(f"Saved to {save_path}")
+        except Exception as e:
+            print(f"Error saving model: {e}")
+            # Clean up the temporary file if it exists
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def load_model(self, model_path: str):
         if not os.path.exists(model_path): 
@@ -464,18 +485,21 @@ class MLModel:
         if 'config' in checkpoint:
             config = checkpoint['config']; print("Loading model configuration from checkpoint...")
             self.bert_model_name = config.get('bert_model_name', self.bert_model_name)
+            if self.bert_model_name == "intfloat/multilingual-e5-small":
+                offline_bert_path = ("/scratch/gpfs/dy5/.cache/huggingface/hub/models--intfloat--multilingual-e5-small"
+                        "/snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846")
+                if os.path.exists(offline_bert_path):
+                    self.bert_model_name = offline_bert_path
             self.hidden_dim = config.get('hidden_dim', self.hidden_dim)
             self.num_layers = config.get('num_layers', self.num_layers)
             self.dropout = config.get('dropout', self.dropout)
             self.task = config.get('task', self.task)
             input_dim = config.get('input_dim', 384 + 1)
             output_dim = config.get('output_dim', 2)
-            if self.bert_model_name == "intfloat/multilingual-e5-small":
-                my_path = "/scratch/gpfs/dy5/.cache/huggingface/hub/models--intfloat--multilingual-e5-small/snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846"
-                if os.path.exists(my_path):
-                    self.bert_model_name = my_path
+
             print(f"Re-initializing BERT with: {self.bert_model_name}")
-            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device), model_kwargs={'torch_dtype': torch.float16})
+            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device), 
+                                            model_kwargs={'torch_dtype': torch.float16})
             self.bert.eval()
             print(f"Re-initializing Classifier with HParams: \
                   hidden={self.hidden_dim}, layers={self.num_layers}, dropout={self.dropout}")

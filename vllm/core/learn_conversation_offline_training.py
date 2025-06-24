@@ -7,6 +7,7 @@ import time
 import sys
 sys.setrecursionlimit(15000)
 import math
+import random
 from torch.optim import Adam
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -220,6 +221,132 @@ class MLModel:
                                             dropout=self.dropout ).to(self._device)
         self.y_true = []
         self.y_pred = []
+
+    def train_online(self, samples: List[Dict[str, Any]], lr: float = 2e-5):
+        """
+        Performs online training on a small batch of new samples.
+        """
+        if not hasattr(self, 'optimizer'):
+            self.optimizer = Adam(self.classifier.parameters(), lr=lr)
+        
+        self.classifier.train()
+        criterion = nn.CrossEntropyLoss() if self.task == "classification" else nn.MSELoss()
+
+        # Convert samples to a DataFrame and DataLoader
+        df = pd.DataFrame(samples)
+        dataset = ConversationTurnDataset(df, task=self.task)
+        dataloader = DataLoader(dataset, shuffle=True, batch_size=len(samples))
+
+        for batch in dataloader:
+            try:
+                input_texts, input_vals, labels = batch
+            except ValueError:
+                print(f"Skipping malformed online batch"); continue
+
+            labels = labels.to(self._device)
+            input_vals = input_vals.to(self._device).float().unsqueeze(1)
+            if self.task == 'regression':
+                labels = labels.float().unsqueeze(1)
+            else:
+                labels = labels.long()
+
+            with torch.no_grad():
+                embeddings = self.bert.encode(list(input_texts), convert_to_tensor=True,
+                                              batch_size=len(input_texts))
+            
+            combined_features = torch.cat((embeddings, input_vals), dim=1)
+            logits = self.classifier(combined_features)
+            loss = criterion(logits, labels)
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            print(f"Online training step finished. Loss: {loss.item():.4f}")
+    
+    def simulate_online(self, train_dataloader: DataLoader, test_dataloader: DataLoader, 
+                        train_steps_per_batch: int = 1, 
+                        lr: float = 2e-5, 
+                        buffer_size: int = 1024, 
+                        replay_sample_size: int = 128, 
+                        prioritize_recent: bool = False):
+        """
+        Simulates online training with a replay buffer.
+        It makes a single pass over the data, and for each incoming batch,
+        it performs multiple training steps by sampling from the buffer.
+        Includes an option to prioritize recent data in sampling.
+        """
+        print("\n--- Starting Online Training Simulation with Replay Buffer ---")
+        replay_buffer = []
+
+        for batch_idx, batch in enumerate(train_dataloader):
+            try:
+                input_texts, input_vals, labels = batch
+            except ValueError:
+                print(f"Skipping malformed online batch {batch_idx}"); continue
+
+            label_name = "follow_up" if self.task == "classification" else "tta"
+            
+            new_samples = []
+            for i in range(len(input_texts)):
+                sample = {
+                    "text": input_texts[i],
+                    "turns": input_vals[i].item(),
+                    label_name: labels[i].item()
+                }
+                new_samples.append(sample)
+            
+            replay_buffer.extend(new_samples)
+            replay_buffer = replay_buffer[-buffer_size:] # Keep buffer size constrained
+
+            # For each incoming batch, perform multiple training steps on the buffer
+            if len(replay_buffer) >= replay_sample_size:
+                for _ in range(train_steps_per_batch):
+                    if prioritize_recent:
+                        # Weight samples by their position in the buffer (newer are higher)
+                        weights = list(range(len(replay_buffer)))
+                        training_batch = random.choices(replay_buffer, weights=weights, k=replay_sample_size)
+                    else:
+                        # Uniform random sampling
+                        training_batch = random.sample(replay_buffer, replay_sample_size)
+                    
+                    self.train_online(training_batch, lr=lr)
+
+            if (batch_idx + 1) % 20 == 0:
+                print(f"\n--- Evaluating at incoming batch {batch_idx + 1} ---")
+                self.classifier.eval()
+                y_true_eval, y_pred_eval = [], []
+                with torch.no_grad():
+                    for test_batch in test_dataloader:
+                        try:
+                            input_texts_test, input_vals_test, labels_test = test_batch
+                        except ValueError:
+                            print("Skipping malformed test batch"); continue
+                        
+                        labels_test = labels_test.to(self._device)
+                        input_vals_test = input_vals_test.to(self._device).float().unsqueeze(1)
+                        if self.task != 'classification':
+                            labels_test = labels_test.float().unsqueeze(1)
+                        else:
+                            labels_test = labels_test.long()
+                        
+                        embeddings = self.bert.encode(list(input_texts_test), convert_to_tensor=True, batch_size=len(input_texts_test))
+                        
+                        combined_features = torch.cat((embeddings, input_vals_test), dim=1)
+                        logits = self.classifier(combined_features)
+
+                        if self.task == "classification":
+                            probabilities = torch.softmax(logits, dim=1)
+                            pred_labels = torch.argmax(probabilities, dim=1)
+                            y_true_eval.extend(labels_test.cpu().numpy())
+                            y_pred_eval.extend(pred_labels.cpu().numpy())
+                
+                if self.task == "classification" and y_true_eval:
+                    metrics = calculate_metrics(y_true_eval, y_pred_eval)
+                    print(f"Evaluation after {batch_idx + 1} batches: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, F1={metrics['f1']}")
+                
+                self.classifier.train() # Restore train mode
+
+        print("--- Online Training Simulation Finished ---")
 
     def train(
         self,
@@ -451,8 +578,9 @@ if __name__ == "__main__":
     task_type = "classification"
     dataset_choice = 'lmsys-chat-1m' #'tay' 'gpt4' #"chatbot_arena" #"sharegpt" # "lmsys-chat-1m"
 
-    N = 10000
-    turn_equal_to = 20
+    mode = "online" # "test" "offline"
+    N = -5000
+    turn_equal_to = 10
     if dataset_choice == "lmsys-chat-1m":
         print("Loading dataset: LMSys-chat-1M from Hugging Face...")
         ds = load_dataset("lmsys/lmsys-chat-1m")  # Use authentication if required
@@ -474,22 +602,26 @@ if __name__ == "__main__":
     else:
         print('dataset not found')
     train_loader, test_loader, test_df = prepare_dataloaders( # Get test_df back
-        df=df, task=task_type, batch_size=256, test_size=0.002
+        df=df, task=task_type, batch_size=64, test_size=0.2
     )
     # --- Initialize Model ---
     mlmodel = MLModel(task=task_type, dataset_choice=dataset_choice, train_mode=True)
 
     # --- Train Model (passing train_loader and test_df) ---
     checkpoint_dir = f"checkpoints_{dataset_choice}_{turn_equal_to}"
-    if N < 0:
+    if mode == "offline":
         os.makedirs(checkpoint_dir, exist_ok=True)
         mlmodel.train(
             train_dataloader=train_loader,
             test_df=test_df, # Pass test_df for evaluation within train
-            num_epochs=20,
-            lr=5e-5,
+            num_epochs=5,
+            lr=1e-4,
             save_dir=checkpoint_dir
         )
+    elif mode == "online":
+        mlmodel.simulate_online(train_loader, test_loader, 
+            train_steps_per_batch=5, lr=1e-4, buffer_size=10000, 
+            replay_sample_size=128, prioritize_recent=True)
     # --- Example: Load Best Model & Use Prediction Methods ---
     
     saved_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
