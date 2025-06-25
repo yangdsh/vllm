@@ -30,6 +30,7 @@ import json
 import os
 import random
 import requests
+import sys
 import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable
@@ -360,11 +361,23 @@ async def benchmark(
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input,
+            output = await request_func(request_func_input=request_func_input,
                                       pbar=pbar)
-        async with semaphore:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+        else:
+            async with semaphore:
+                output = await request_func(
+                    request_func_input=request_func_input, pbar=pbar)
+
+        print(f"[trace],"
+              f"{request_func_input.conversation_id},"
+              f"{request_func_input.prompt_len},"
+              f"{output.prompt_len},"
+              f"{request_func_input.output_len},"
+              f"{request_func_input.turn_id},"
+              f"{output.start_time},"
+              f"{output.done_time}",
+              file=sys.stderr)
+        return output
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -451,7 +464,6 @@ async def benchmark(
     response = requests.get(metrics_url)
     for line in response.text.split("\n"):
         if "gpu_prefix_cache_hit_rate{" in line:
-            print(line)
             hit_ratio=line.split(' ')[-1]
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))

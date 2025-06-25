@@ -400,9 +400,9 @@ class MLModel:
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
-            print(f"Online training step finished. Loss: {loss.item():.4f}")
 
         self.classifier.eval()
+        return loss.item()
 
 
     def predict_single_processed(

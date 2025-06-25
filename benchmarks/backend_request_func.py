@@ -77,6 +77,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     server: str = "localhost"
+    start_time: float = 0.0
     done_time: float = 0.0
 
 
@@ -486,6 +487,7 @@ async def async_request_openai_chat_completions(
         return hint
     
     def update_conversation(conversation_id, generated_text, generated_tokens):
+        conversation_last_time[conversation_id] = time.time()
         conversation_history[conversation_id].append(
             {
                 "role": "assistant",
@@ -493,7 +495,6 @@ async def async_request_openai_chat_completions(
                 "token_ids": generated_tokens
             }
         )
-        conversation_last_time[conversation_id] = time.time()
     
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
@@ -531,6 +532,7 @@ async def async_request_openai_chat_completions(
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
+        output.start_time = st
         n_running_req += 1
         #print(round(time.time()-start_time,2), request_func_input.timestamp, 
         #      request_func_input.conversation_id, n_completed_req)
@@ -579,6 +581,7 @@ async def async_request_openai_chat_completions(
                     update_conversation(request_func_input.conversation_id, generated_text, generated_tokens)
                     output.success = True
                     output.latency = most_recent_timestamp - st
+                    output.done_time = time.perf_counter()
                     #print(request_func_input.conversation_id, request_func_input.turn_id,
                     #    len(output.itl), request_func_input.output_len, output.latency)
                 else:

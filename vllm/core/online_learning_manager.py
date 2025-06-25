@@ -36,9 +36,6 @@ class OnlineLearningManager:
         self.enable_online_learning = self.eviction_algorithm_config.get(
             "enable_online_learning", False)
         self.model_path = self.eviction_algorithm_config.get("model_path", "")
-        self.lr = self.eviction_algorithm_config.get("learning_rate", 5e-4)
-        self.training_batch_size = 32
-        self.conversation_timeout = 300  # 5 minutes
 
         if os.path.exists(self.model_path):
             if ENABLE_DEBUG_PRINTS:
@@ -87,6 +84,12 @@ class OnlineLearningManager:
 
     def _online_learning_setup(self):
         """Initializes components for online model training."""
+        self.replay_buffer_size = self.eviction_algorithm_config.get("replay_buffer_size", 16384)
+        self.replay_sample_size = self.eviction_algorithm_config.get("replay_sample_size", 128)
+        self.prioritize_recent = self.eviction_algorithm_config.get("prioritize_recent", True)
+        self.training_interval = self.eviction_algorithm_config.get("training_interval", 5)  # seconds
+        self.lr = self.eviction_algorithm_config.get("learning_rate", 1e-4)
+        self.conversation_timeout = self.eviction_algorithm_config.get("conversation_timeout", 300)  # 5 minutes
         self.warmup_finished_time = time.time() + self.conversation_timeout
 
         # Track conversations, not individual sequences
@@ -97,10 +100,6 @@ class OnlineLearningManager:
 
         # --- Replay buffer parameters (can be made configurable) ---
         self.replay_buffer: List[Dict] = []
-        self.replay_buffer_size = self.eviction_algorithm_config.get("replay_buffer_size", 16384)
-        self.replay_sample_size = self.eviction_algorithm_config.get("replay_sample_size", 128)
-        self.prioritize_recent = self.eviction_algorithm_config.get("prioritize_recent", True)
-        self.training_interval = self.eviction_algorithm_config.get("training_interval", 10)  # seconds
 
         self._training_thread = threading.Thread(
             target=self._training_worker_loop, daemon=True)
@@ -143,9 +142,9 @@ class OnlineLearningManager:
                 else:
                     batch_to_train = random.sample(self.replay_buffer, self.replay_sample_size)
                 with self._ml_model_lock:
-                    self.ml_model.train_online(batch_to_train, lr=self.lr)
+                    loss = self.ml_model.train_online(batch_to_train, lr=self.lr)
                 if ENABLE_DEBUG_PRINTS:
-                    print("[DEBUG] Training complete on replay buffer batch.")
+                    print(f"[DEBUG] Training Loss: {loss:.4f}")
 
     def _generate_all_available_timeout_samples(self, batch: List[Dict]):
         """Generate negative samples from timed out conversations."""
@@ -183,7 +182,7 @@ class OnlineLearningManager:
         # schedule the prediction
         self.schedule_prediction(first_seq.cache_hint)
 
-        if not self.enable_online_learning or time.time() < self.warmup_finished_time:
+        if not self.enable_online_learning:
             return
 
         conv_id = first_seq.cache_hint['id']
