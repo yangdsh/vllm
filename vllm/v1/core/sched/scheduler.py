@@ -7,6 +7,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Any, Optional, Union
+import logging
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
@@ -266,6 +267,12 @@ class Scheduler(SchedulerInterface):
                     else:
                         preempted_req = self.running.pop()
 
+                    # DEBUG: Log preemption event
+                    print(f"[PREEMPTION_DEBUG] Preempting request {preempted_req.request_id} "
+                          f"(computed_tokens: {preempted_req.num_computed_tokens}, "
+                          f"total_tokens: {preempted_req.num_tokens}) "
+                          f"to schedule request {request.request_id}", flush=True)
+
                     self.kv_cache_manager.free(preempted_req)
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
@@ -486,6 +493,10 @@ class Scheduler(SchedulerInterface):
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
+                    # DEBUG: Log when a preempted request is rescheduled
+                    print(f"[RESCHEDULE_DEBUG] Rescheduling preempted request {request.request_id} "
+                          f"(computed_tokens: {request.num_computed_tokens}, "
+                          f"total_tokens: {request.num_tokens})", flush=True)
                     scheduled_resumed_reqs.append(request)
                 else:
                     raise RuntimeError(
@@ -609,6 +620,20 @@ class Scheduler(SchedulerInterface):
             self.requests[req_id].num_computed_tokens += num_scheduled_token
 
         self.finished_req_ids = set()
+        
+        # Commit prefix cache statistics for scheduled requests
+        if self.log_stats:
+            # Only commit pending statistics for successfully scheduled NEW requests (not resumed ones)
+            # This ensures we only count fresh requests in cache hit statistics
+            for request in scheduled_new_reqs:
+                if self.kv_cache_manager.prefix_cache_stats is not None:
+                    self.kv_cache_manager.prefix_cache_stats.commit_pending_stats(request.request_id)
+            
+            # Do NOT commit statistics for resumed requests to exclude rescheduled requests from metrics
+            # for request in scheduled_resumed_reqs:
+            #     if self.kv_cache_manager.prefix_cache_stats is not None:
+            #         self.kv_cache_manager.prefix_cache_stats.commit_pending_stats(request.request_id)
+        
         return scheduler_output
 
     def _make_cached_request_data(
@@ -962,6 +987,9 @@ class Scheduler(SchedulerInterface):
         # Second pass: set status and free requests
         for request in valid_requests:
             request.status = finished_status
+            # Discard pending prefix cache statistics for finished requests
+            if self.log_stats and self.kv_cache_manager.prefix_cache_stats is not None:
+                self.kv_cache_manager.prefix_cache_stats.discard_pending_stats(request.request_id)
             self._free_request(request)
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
@@ -975,6 +1003,10 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+
+        # Discard any pending prefix cache statistics for this request
+        if self.log_stats and self.kv_cache_manager.prefix_cache_stats is not None:
+            self.kv_cache_manager.prefix_cache_stats.discard_pending_stats(request_id)
 
         if not delay_free_blocks:
             self._free_blocks(request)

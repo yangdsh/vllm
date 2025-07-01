@@ -158,10 +158,6 @@ class KVCacheManager:
                                                self.block_size, request)
             self.req_to_block_hashes[request.request_id] = block_hashes
 
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.requests += 1
-
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
         # This can trigger recomputation of an entire block, rather than just
@@ -173,10 +169,17 @@ class KVCacheManager:
             self.coordinator.find_longest_cache_hit(block_hashes,
                                                     max_cache_hit_length))
 
+        # Record pending statistics instead of committing immediately  
         if self.log_stats:
             assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.queries += request.num_tokens
-            self.prefix_cache_stats.hits += num_new_computed_tokens
+            # Only record for fresh requests (num_computed_tokens == 0) to avoid double counting
+            # and exclude rescheduled/preempted requests from statistics
+            if request.num_computed_tokens == 0:
+                self.prefix_cache_stats.record_pending_query(
+                    req_id=request.request_id,
+                    queries=request.num_tokens,
+                    hits=num_new_computed_tokens
+                )
 
         return KVCacheBlocks(computed_blocks), num_new_computed_tokens
 
@@ -315,6 +318,8 @@ class KVCacheManager:
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
+            # Also reset any pending statistics when cache is reset
+            self.prefix_cache_stats.reset_stats()
         return True
 
     def get_num_common_prefix_blocks(

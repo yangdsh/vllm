@@ -14,7 +14,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class PrefixCacheStats:
-    """Stores prefix cache hit statistics."""
+    """Stores prefix cache hit statistics for fresh requests only.
+    
+    Only tracks statistics for initial requests that are successfully scheduled.
+    Rescheduled/preempted requests are excluded to avoid double counting and
+    provide cleaner cache effectiveness metrics.
+    """
     # Whether reset_prefix_cache was invoked.
     reset: bool = False
     # The number of requests in this update.
@@ -24,6 +29,47 @@ class PrefixCacheStats:
     queries: int = 0
     # The number of hits in these requests.
     hits: int = 0
+    
+    # Pending statistics - only committed when requests are scheduled
+    _pending_stats: dict[str, dict[str, int]] = field(default_factory=dict)  # req_id -> {requests, queries, hits}
+
+    def record_pending_query(self, req_id: str, queries: int, hits: int):
+        """Record a pending query that may be committed later."""
+        if req_id not in self._pending_stats:
+            self._pending_stats[req_id] = {
+                'requests': 1,
+                'queries': queries,
+                'hits': hits
+            }
+            print(f"[VLLM_PREFIX_CACHE_PENDING] Request {req_id} | Pending stats: {queries} queries, {hits} hits", flush=True)
+        else:
+            # Request already has pending stats - don't update (avoid double counting)
+            print(f"[VLLM_PREFIX_CACHE_PENDING] Request {req_id} | Ignoring repeat query (already have pending stats)", flush=True)
+
+    def commit_pending_stats(self, req_id: str):
+        """Commit pending statistics for a successfully scheduled request."""
+        if req_id in self._pending_stats:
+            stats = self._pending_stats.pop(req_id)
+            
+            # Commit to actual stats
+            self.requests += stats['requests']
+            self.queries += stats['queries']
+            self.hits += stats['hits']
+                
+            print(f"[VLLM_PREFIX_CACHE_COMMIT] Request {req_id} | Committed stats: {stats['queries']} queries, {stats['hits']} hits", flush=True)
+
+    def discard_pending_stats(self, req_id: str):
+        """Discard pending statistics for a request that was not scheduled."""
+        if req_id in self._pending_stats:
+            stats = self._pending_stats.pop(req_id)
+            print(f"[VLLM_PREFIX_CACHE_DISCARD] Request {req_id} | Discarded stats: {stats['queries']} queries, {stats['hits']} hits", flush=True)
+
+    def reset_stats(self) -> None:
+        """Reset all statistics."""
+        self.requests = 0
+        self.queries = 0
+        self.hits = 0
+        self._pending_stats = {}
 
 
 @dataclass
