@@ -121,7 +121,8 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s, "
             "Running: %d reqs, Waiting: %d reqs, "
             "GPU KV cache usage: %.1f%%, "
-            "Prefix cache hit rate: %.1f%%",
+            "Prefix cache hit rate: %.1f%%, "
+            "Preemptions: %d, Reschedules: %d",
             self.engine_index,
             prompt_throughput,
             generation_throughput,
@@ -129,6 +130,8 @@ class LoggingStatLogger(StatLoggerBase):
             scheduler_stats.num_waiting_reqs,
             scheduler_stats.kv_cache_usage * 100,
             self.prefix_caching_metrics.hit_rate * 100,
+            scheduler_stats.preemption_stats.preemptions,
+            scheduler_stats.preemption_stats.reschedules,
         )
         self.spec_decoding_logging.log(log_fn=log_fn)
 
@@ -233,9 +236,14 @@ class PrometheusStatLogger(StatLoggerBase):
         #
         # Counters
         #
-        self.counter_num_preempted_reqs = self._counter_cls(
-            name="vllm:num_preemptions",
-            documentation="Cumulative number of preemption from the engine.",
+        self.counter_preemptions = self._counter_cls(
+            name="vllm:preemptions",
+            documentation="Cumulative number of preemptions from the scheduler.",
+            labelnames=labelnames).labels(*labelvalues)
+        
+        self.counter_reschedules = self._counter_cls(
+            name="vllm:reschedules", 
+            documentation="Cumulative number of reschedules after preemption.",
             labelnames=labelnames).labels(*labelvalues)
 
         self.counter_prompt_tokens = self._counter_cls(
@@ -440,6 +448,11 @@ class PrometheusStatLogger(StatLoggerBase):
             self.counter_prefix_cache_hits.inc(
                 scheduler_stats.prefix_cache_stats.hits)
 
+            # Record preemption statistics
+            # preemption_stats is never cleared, so we can just set the value
+            self.counter_preemptions._value._value = scheduler_stats.preemption_stats.preemptions
+            self.counter_reschedules._value._value = scheduler_stats.preemption_stats.reschedules
+
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats)
@@ -447,7 +460,6 @@ class PrometheusStatLogger(StatLoggerBase):
         if iteration_stats is None:
             return
 
-        self.counter_num_preempted_reqs.inc(iteration_stats.num_preempted_reqs)
         self.counter_prompt_tokens.inc(iteration_stats.num_prompt_tokens)
         self.counter_generation_tokens.inc(
             iteration_stats.num_generation_tokens)

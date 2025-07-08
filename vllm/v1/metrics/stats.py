@@ -41,10 +41,9 @@ class PrefixCacheStats:
                 'queries': queries,
                 'hits': hits
             }
-            print(f"[VLLM_PREFIX_CACHE_PENDING] Request {req_id} | Pending stats: {queries} queries, {hits} hits", flush=True)
         else:
             # Request already has pending stats - don't update (avoid double counting)
-            print(f"[VLLM_PREFIX_CACHE_PENDING] Request {req_id} | Ignoring repeat query (already have pending stats)", flush=True)
+            pass
 
     def commit_pending_stats(self, req_id: str):
         """Commit pending statistics for a successfully scheduled request."""
@@ -55,14 +54,11 @@ class PrefixCacheStats:
             self.requests += stats['requests']
             self.queries += stats['queries']
             self.hits += stats['hits']
-                
-            print(f"[VLLM_PREFIX_CACHE_COMMIT] Request {req_id} | Committed stats: {stats['queries']} queries, {stats['hits']} hits", flush=True)
 
     def discard_pending_stats(self, req_id: str):
         """Discard pending statistics for a request that was not scheduled."""
         if req_id in self._pending_stats:
             stats = self._pending_stats.pop(req_id)
-            print(f"[VLLM_PREFIX_CACHE_DISCARD] Request {req_id} | Discarded stats: {stats['queries']} queries, {stats['hits']} hits", flush=True)
 
     def reset_stats(self) -> None:
         """Reset all statistics."""
@@ -70,6 +66,20 @@ class PrefixCacheStats:
         self.queries = 0
         self.hits = 0
         self._pending_stats = {}
+
+
+@dataclass
+class PreemptionStats:
+    """Stores preemption statistics."""
+    # Total number of preemptions that occurred
+    preemptions: int = 0
+    # Total number of requests that were rescheduled after preemption
+    reschedules: int = 0
+
+    def reset_stats(self) -> None:
+        """Reset all statistics."""
+        self.preemptions = 0
+        self.reschedules = 0
 
 
 @dataclass
@@ -83,6 +93,9 @@ class SchedulerStats:
 
     prefix_cache_stats: PrefixCacheStats = field(
         default_factory=PrefixCacheStats)
+    
+    preemption_stats: PreemptionStats = field(
+        default_factory=PreemptionStats)
 
     spec_decoding_stats: Optional[SpecDecodingStats] = None
 
