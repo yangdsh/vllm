@@ -390,12 +390,13 @@ async def async_request_openai_chat_completions(
     cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
     if request_func_input.turn_id > 0:
         while cur_turn_id != request_func_input.turn_id:
-            cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
             await asyncio.sleep(3)
             if time.time() - start_time > request_func_input.time_limit:
                 output = RequestFuncOutput()
                 output.error = "timeout"
                 return output
+            cur_turn_id = len(conversation_history[request_func_input.conversation_id]) // 2
+            
         scheduled_time = conversation_last_time[request_func_input.conversation_id] \
             + request_func_input.interval
         if scheduled_time - start_time + request_func_input.output_len / 30 > request_func_input.time_limit:

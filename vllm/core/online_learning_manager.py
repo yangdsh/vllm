@@ -64,6 +64,7 @@ class OnlineLearningManager:
         self._online_learning_setup()
 
     def schedule_prediction(self, cache_hint: Dict):
+        # only ml eviction algorithm does not have prob_has_next
         if 'prob_has_next' not in cache_hint:
             self.to_predict_queue.put(cache_hint)
 
@@ -78,7 +79,10 @@ class OnlineLearningManager:
             with self._ml_model_lock:
                 # print('predicting:', cache_hint["conversation_input"])
                 prob = self.ml_model.predict_single_processed(
-                    cache_hint["conversation_input"], cache_hint["turns"])
+                    cache_hint["conversation_input"], 
+                    cache_hint["turns"], 
+                    cache_hint["true_tta"]
+                )
             cache_hint["prob_has_next"] = prob
             self.to_predict_queue.task_done()
 

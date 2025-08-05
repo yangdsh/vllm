@@ -125,8 +125,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator)
 
         # === Online Learning Integration ===
-        self.online_learning_manager = OnlineLearningManager(
-            eviction_algorithm_config=eviction_algorithm_config)
+        if 'ml' in eviction_algorithm:
+            self.online_learning_manager = OnlineLearningManager(
+                eviction_algorithm_config=eviction_algorithm_config)
+        else:
+            self.online_learning_manager = None
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -208,7 +211,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self._last_access_blocks_tracker.add_seq(seq.seq_id)
 
         # --- Online Learning: Track new conversations and generate positive samples ---
-        self.online_learning_manager.on_allocate(seq_group)
+        if self.online_learning_manager:
+            self.online_learning_manager.on_allocate(seq_group)
 
         # Allocate cross-attention block table for encoder sequence
         #
@@ -281,7 +285,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             return
 
         # --- Online Learning: Update conversation state on free ---
-        self.online_learning_manager.on_free(seq)
+        if self.online_learning_manager:
+            self.online_learning_manager.on_free(seq)
 
         # Propagate sequence-level metadata to the block-level.
         # This is required for the evictor to have the correct cache hints.
