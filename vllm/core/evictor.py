@@ -6,10 +6,13 @@ import json
 import time
 import statistics
 import numpy as np
+import threading
 from collections import defaultdict
 from sortedcontainers import SortedDict
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
+
+from vllm.core.evictor_profiler import EvictionProfiler, MLAccuracyTracker
 
 def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time, debug=False):
     if prob_has_next == 0 or exp_scale == 0:
@@ -103,7 +106,7 @@ class CacheStat:
             print(f"Summary for {key}: Mean = {mean:.2f}, Std Dev = {std_dev:.2f}")
             has_data = 1
         return has_data
-        
+
 
 class BlockMetaData:
     """Data structure for storing key data describe cached block, so that
@@ -131,8 +134,21 @@ class LRUMLEvictor(Evictor):
         self.to_delete_blocks = []
         self.config = self.parse_str_to_dict(config)
         self.stat = CacheStat()
+        
+        # Increased refresh interval
         self.last_refresh_time = time.time()
-        self.INSPECT_INTERVAL = 5
+        self.refresh_count = 0
+        self.INSPECT_INTERVAL = 10  # Increased from 5 to reduce overhead
+        
+        # Background threading for rescoring
+        self._rescore_lock = threading.Lock()
+        self._rescore_thread = None
+        
+        # Profiler
+        self.profiler = EvictionProfiler()
+        
+        # ML accuracy tracker
+        self.accuracy_tracker = MLAccuracyTracker(threshold=0.5, report_interval=100)
 
     def __contains__(self, block_id: int) -> bool:
         return block_id in self.free_table
@@ -142,145 +158,177 @@ class LRUMLEvictor(Evictor):
             return {}
         return json.loads(s)
 
-    def calc_score(self, block_id, last_accessed, cache_hint):
-        if 'use_lru' in cache_hint and cache_hint['use_lru']:
+    def _calc_score(self, block_id: int, last_accessed: float, cache_hint: dict) -> float:
+        with self.profiler.time_operation("calc_score"):
+            if cache_hint.get('use_lru'):
+                return last_accessed
+            if cache_hint.get('use_fifo'):
+                return self.id_to_first_access.get(block_id, last_accessed)
+            if 'next_timestamp' in cache_hint:
+                return -cache_hint['next_timestamp']
+            
+            prob_has_next = cache_hint.get('prob_has_next')
+            if prob_has_next is not None:
+                return probability_of_future_arrival(
+                    prob_has_next,
+                    cache_hint.get('exp_scale', 1.0),
+                    time.time() - last_accessed
+                )
+            
+            # Default to LRU if no other hint is available
             return last_accessed
-        if 'use_fifo' in cache_hint and cache_hint['use_fifo']:
-            return self.id_to_first_access[block_id]
-        if 'next_timestamp' in cache_hint:
-            return -cache_hint['next_timestamp']
-        if 'prob_has_next' in cache_hint:
-            prob = probability_of_future_arrival(
-                cache_hint['prob_has_next'], cache_hint['exp_scale'], time.time() - last_accessed)
-            return prob
 
     def evict(self) -> Tuple[int, int]:
-        if len(self.free_table) == 0:
-            raise ValueError("No usable cache memory left")
-        block_id = -1
-        while block_id not in self.free_table:
-            if len(self.to_delete_blocks) > 0:
-                (block_id, content_hash, last_accessed) = self.to_delete_blocks.pop()
-                if block_id not in self.free_table or self.free_table[block_id].last_accessed != last_accessed:
-                    continue
-            else:
-                _, (block_id, content_hash) = self.sorted_dict.popitem(0)
-        if block_id in self.free_table:
-            survival_time = time.time() - self.free_table[block_id].last_accessed
-            self.stat.append("survival_times", survival_time)
-            del self.free_table[block_id]
-            del self.id_to_first_access[block_id]
-            return block_id, content_hash
-        else:
-            # print('block is not in the sorted_dict')
-            raise ValueError("block is not in the sorted_dict")
-    
+        with self._rescore_lock, self.profiler.time_operation("evict_total"):
+            if not self.free_table:
+                raise ValueError("No usable cache memory left")
+            
+            block_id_to_evict = -1
+            content_hash = -1
+
+            # Prioritize evicting outdated blocks
+            while self.to_delete_blocks:
+                block_id, content_hash, last_accessed = self.to_delete_blocks.pop(0)
+                if block_id in self.free_table and self.free_table[block_id].last_accessed == last_accessed:
+                    block_id_to_evict = block_id
+                    break
+            
+            # If no outdated block was found/valid, evict based on score
+            if block_id_to_evict == -1:
+                while self.sorted_dict:
+                    _, (block_id, ch) = self.sorted_dict.popitem(0)
+                    if block_id in self.free_table:
+                        block_id_to_evict = block_id
+                        content_hash = ch
+                        break
+            
+            if block_id_to_evict != -1:
+                survival_time = time.time() - self.free_table[block_id_to_evict].last_accessed
+                self.stat.append("survival_times", survival_time)
+                if content_hash == -1:
+                    content_hash = self.free_table[block_id_to_evict].content_hash
+                
+                del self.free_table[block_id_to_evict]
+                if block_id_to_evict in self.id_to_first_access:
+                    del self.id_to_first_access[block_id_to_evict]
+                return block_id_to_evict, content_hash
+            
+            raise ValueError("Eviction failed: could not find a block to evict.")
+
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
-        score = self.calc_score(block_id, last_accessed, cache_hint)
-        # print("add: ", block_id, cache_hint)
-        self.free_table[block_id] = BlockMetaData(content_hash,
-                                                  num_hashed_tokens,
-                                                  last_accessed,
-                                                  cache_hint,
-                                                  score)
-        self.sorted_dict[(score, last_accessed, block_id)] = (block_id, content_hash)
-        self.id_to_last_access[cache_hint['id']] = last_accessed
-        if block_id not in self.id_to_first_access:
-            self.id_to_first_access[block_id] = last_accessed
-        if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:
-            self._refresh()
+        with self._rescore_lock, self.profiler.time_operation("add"):
+            score = self._calc_score(block_id, last_accessed, cache_hint)
+            self.free_table[block_id] = BlockMetaData(content_hash,
+                                                      num_hashed_tokens,
+                                                      last_accessed,
+                                                      cache_hint,
+                                                      score)
+            self.sorted_dict[(score, last_accessed, block_id)] = (block_id, content_hash)
+            if 'id' in cache_hint:
+                self.id_to_last_access[cache_hint['id']] = last_accessed
+            if block_id not in self.id_to_first_access:
+                self.id_to_first_access[block_id] = last_accessed
+            
+            # Track ML accuracy
+            if 'prob_has_next' in cache_hint and 'true_tta' in cache_hint:
+                prob = cache_hint['prob_has_next']
+                true_tta = cache_hint['true_tta']
+                self.accuracy_tracker.record(prob, true_tta)
+                
+            # Background threading: trigger async refresh
+            if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:
+                self._trigger_background_refresh()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
-        if block_id not in self.free_table:
-            raise ValueError("Attempting to update block that's not in the evictor")
-        print("update: ", block_id, cache_hint['turns'])
-        old_score = self.free_table[block_id].score
-        old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
-        if old_entry in self.sorted_dict:
-            del self.sorted_dict[old_entry]
-        else:
-            raise ValueError("the score is not found in sorted_dict")
-        
-        score = self.calc_score(block_id, last_accessed, cache_hint)
-        self.free_table[block_id].last_accessed = last_accessed
-        self.free_table[block_id].cache_hint = cache_hint
-        self.free_table[block_id].score = score
-        
-        self.sorted_dict[(score, last_accessed, block_id)] = (block_id, self.free_table[block_id].content_hash)
-        self.id_to_last_access[cache_hint['id']] = last_accessed
+        with self._rescore_lock, self.profiler.time_operation("update"):
+            if block_id not in self.free_table:
+                return
 
-    # remove is only called by 'hit', the blocks will be added back later after decoding
+            old_meta = self.free_table[block_id]
+            old_entry = (old_meta.score, old_meta.last_accessed, block_id)
+            
+            if old_entry in self.sorted_dict:
+                del self.sorted_dict[old_entry]
+            
+            score = self._calc_score(block_id, last_accessed, cache_hint)
+            self.free_table[block_id].last_accessed = last_accessed
+            self.free_table[block_id].cache_hint = cache_hint
+            self.free_table[block_id].score = score
+            
+            self.sorted_dict[(score, last_accessed, block_id)] = (block_id, self.free_table[block_id].content_hash)
+            if 'id' in cache_hint:
+                self.id_to_last_access[cache_hint['id']] = last_accessed
+
     def remove(self, block_id: int):
-        if block_id not in self.free_table:
-            raise ValueError("Attempting to remove block that's not in the evictor")
-        
-        # print("remove: ", block_id)
-        old_score = self.free_table[block_id].score
-        old_entry = (old_score, self.free_table[block_id].last_accessed, block_id)
-        if old_entry in self.sorted_dict:
-            del self.sorted_dict[old_entry]
-        else:
-            raise ValueError("the score is not found in sorted_dict")
-        del self.free_table[block_id]
+        with self._rescore_lock, self.profiler.time_operation("remove"):
+            if block_id not in self.free_table:
+                # This can happen due to race conditions or hash collisions
+                # where the block was already removed by another thread
+                return
+            
+            old_meta = self.free_table[block_id]
+            old_entry = (old_meta.score, old_meta.last_accessed, block_id)
+            if old_entry in self.sorted_dict:
+                del self.sorted_dict[old_entry]
+            del self.free_table[block_id]
 
     @property
     def num_blocks(self) -> int:
         return len(self.free_table)
 
-    def _refresh(self):
-        new_sorted_dict = SortedDict()
+    def _trigger_background_refresh(self):
+        """Background threading: trigger refresh in background thread"""
+        if self._rescore_thread is not None and self._rescore_thread.is_alive():
+            return  # Already running
+            
+        self._rescore_thread = threading.Thread(target=self._background_refresh_worker, daemon=True)
+        self._rescore_thread.start()
 
-        for block_id, block in self.free_table.items():
-            score = self.calc_score(block_id, block.last_accessed, block.cache_hint)
-            block.score = score
-            new_sorted_dict[(score, block.last_accessed, block_id)] = (block_id, block.content_hash)
+    def _background_refresh_worker(self):
+        """Background worker for rescoring and finding outdated blocks"""
+        try:
+            with self._rescore_lock:
+                with self.profiler.time_operation("background_refresh_total"):
+                    self._rescore_all_blocks()
+                    self._find_and_mark_outdated_blocks()
+                    self.last_refresh_time = time.time()
+                    self.refresh_count += 1
+                    # Print profiler stats periodically
+                    if self.refresh_count % 10 == 9:
+                        self.profiler.print_stats()
+        except Exception as e:
+            print(f"Error in background refresh: {e}")
 
-        self.sorted_dict = new_sorted_dict
-
-        print('num blocks: ', self.num_blocks)
-
-        self.last_refresh_time = time.time()
-        stat_ = CacheStat()
-        # Create a list of (block_id, survival_time) tuples
-        survival_list = [
-            (block_id, self.free_table[block_id].cache_hint['id'], self.free_table[block_id].last_accessed)
-            for block_id in self.free_table
-        ]
-        # Sort by survival_time in descending order
-        survival_list.sort(key=lambda x: (x[2], x[1]))
-
-        # mark outdated blocks 
-        to_delete_cnt = 0
-        for block_id, _, _ in survival_list:
-            block = self.free_table[block_id]
-            id = block.cache_hint['id']
-            if self.id_to_last_access[id] == block.last_accessed:
-                continue
-            if self.id_to_last_access[id] != block.last_accessed:
-                self.to_delete_blocks.append((block_id, block.content_hash, block.last_accessed))
-                to_delete_cnt += 1
-        print("mark outdated blocks cnt: ", to_delete_cnt)
-
-        # Print top 10
-        cnt = 0
-        temp = 0
-        print('Top 10 blocks with oldest last_accessed time:')
-        for block_id, _, _ in survival_list:
-            block = self.free_table[block_id]
-            if block.last_accessed == temp:
-                continue
-            temp = block.last_accessed
-            cnt += 1
-            if cnt > 10:
-                break
-            print(block.cache_hint['true_tta'], block.score, block.last_accessed)
-
-        for block_id in self.free_table:
-            survival_time = time.time() - self.free_table[block_id].last_accessed
-            stat_.append("survival_times", survival_time)
-        print('For all blocks in the cache:')
-        stat_.summary()
+    def _rescore_all_blocks(self):
+        """Rescore all blocks - runs in background thread"""
+        with self.profiler.time_operation("rescore_all_blocks"):
+            snapshot_items = list(self.free_table.items())  # Snapshot to avoid size change during iteration
+            new_sorted_dict = SortedDict()
+            for block_id, block_meta in snapshot_items:
+                block_meta.score = self._calc_score(block_id, block_meta.last_accessed, block_meta.cache_hint)
+                new_sorted_dict[(block_meta.score, block_meta.last_accessed, block_id)] = (block_id, block_meta.content_hash)
+            self.sorted_dict = new_sorted_dict
+    
+    def _find_and_mark_outdated_blocks(self):
+        """Efficient outdated block detection: group by conversation ID"""
+        with self.profiler.time_operation("find_outdated_blocks"):
+            self.to_delete_blocks.clear()
+            
+            snapshot_items = list(self.free_table.items())  # snapshot
+            # Group blocks by conversation ID for efficient processing
+            conv_blocks = defaultdict(list)
+            for block_id, block_meta in snapshot_items:
+                conv_id = block_meta.cache_hint.get('id')
+                if conv_id:
+                    conv_blocks[conv_id].append((block_id, block_meta))
+            
+            # Check each conversation's blocks
+            for conv_id, blocks in conv_blocks.items():
+                latest_access = self.id_to_last_access.get(conv_id, 0)
+                for block_id, block_meta in blocks:
+                    if latest_access > block_meta.last_accessed:
+                        self.to_delete_blocks.append((block_id, block_meta.content_hash, block_meta.last_accessed))
 
 class LRUEvictor(Evictor):
     """Evicts in a least-recently-used order using the last_accessed timestamp

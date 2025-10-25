@@ -21,7 +21,7 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
 
 from vllm.model_executor.model_loader.weight_utils import get_lock
 
-from vllm.core.learn_conversation import combine_user_requests
+from vllm.core.evictor_ml_model import combine_user_requests
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -404,7 +404,8 @@ async def async_request_openai_chat_completions(
             output.error = "timeout"
             return output
         wait_for = scheduled_time - time.time()
-        await asyncio.sleep(wait_for)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
         request_func_input.timestamp += time.time() - receive_time
         request_func_input.next_timestamp += time.time() - receive_time \
             + request_func_input.output_len / 30 # assume token throughput is 30
@@ -514,6 +515,8 @@ async def async_request_openai_chat_completions(
         }
         if request_func_input.use_token_id:
             payload["prompt_tokens"] = get_prompt_tokens(request_func_input)
+        if "prompt_tokens" in payload:
+            request_func_input.prompt_len = len(payload["prompt_tokens"])
         if request_func_input.ignore_eos:
             payload["ignore_eos"] = request_func_input.ignore_eos
         if request_func_input.extra_body:

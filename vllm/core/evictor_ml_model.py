@@ -360,7 +360,6 @@ class MLModel:
         # Ensure model is in eval mode after all epochs are done
         self.classifier.eval()
 
-
     def train_online(self, samples: List[Dict[str, Any]], lr: float = 2e-5):
         """
         Performs online training on a small batch of new samples.
@@ -403,57 +402,6 @@ class MLModel:
 
         self.classifier.eval()
         return loss.item()
-
-
-    def predict_single_processed(
-        self,
-        preprocessed_text: str, # Takes preprocessed text now
-        turns: int,
-        true_label = -1,
-        no_embedding: bool = False,
-        return_prob: bool = True
-    ) -> Union[float, int]:
-        """
-        Predicts outcome for a single instance using PREPROCESSED text.
-        Performs direct inference.
-        """
-        self.classifier.eval() # Ensure evaluation mode
-        
-        # print(preprocessed_text, turns)
-
-        # 1. Prepare input tensors
-        input_vals = torch.tensor([[turns]] * 1, dtype=torch.float).to(self._device)
-
-        # 2. Encode text (already preprocessed)
-        with torch.no_grad():
-            # Note: Encoding even a single sentence has overhead.
-            embeddings = self.bert.encode([preprocessed_text] * 1, convert_to_tensor=True, batch_size=1)
-            if no_embedding:
-                embeddings.zero_()
-
-            # 3. Combine features
-            combined_features = torch.cat((embeddings, input_vals), dim=1)
-
-            # 4. Perform inference
-            logits = self.classifier(combined_features)
-
-        # 5. Process output
-        if self.task == "regression":
-            return logits.item()
-        else: # Classification
-            probabilities = torch.softmax(logits, dim=1)
-            pred_label = torch.argmax(probabilities, dim=1)[0].item() # Label 0 or 1
-            if true_label >= 0:
-                self.y_true.append(true_label)
-                self.y_pred.append(pred_label)
-                if len(self.y_true) % 100 == 0:
-                    metrics = calculate_metrics(self.y_true, self.y_pred)
-                    print(f"Precision={metrics['precision']:.4f}, \
-                      Recall={metrics['recall']:.4f}, F1={metrics['f1']}")
-            if return_prob:
-                return probabilities[0, 1].item() # Prob of class 1
-            else:
-                return logits
 
     def save_model(self, save_path: str):
         # Atomic save using a temporary file and rename
@@ -512,6 +460,109 @@ class MLModel:
             self.classifier.load_state_dict(checkpoint) # Legacy
         self.classifier.to(self._device); self.classifier.eval()
         print(f"Classifier state_dict loaded from {model_path} and set to eval mode.")
+
+    def predict_single_processed(
+        self,
+        preprocessed_text: str, # Takes preprocessed text now
+        turns: int,
+        true_label = -1,
+        no_embedding: bool = False,
+        return_prob: bool = True
+    ) -> Union[float, int]:
+        """
+        Predicts outcome for a single instance using PREPROCESSED text.
+        Performs direct inference.
+        """
+        self.classifier.eval() # Ensure evaluation mode
+        
+        # print(preprocessed_text, turns)
+
+        # 1. Prepare input tensors
+        input_vals = torch.tensor([[turns]] * 1, dtype=torch.float).to(self._device)
+
+        # 2. Encode text (already preprocessed)
+        with torch.no_grad():
+            # Note: Encoding even a single sentence has overhead.
+            embeddings = self.bert.encode([preprocessed_text] * 1, convert_to_tensor=True, batch_size=1)
+            if no_embedding:
+                embeddings.zero_()
+
+            # 3. Combine features
+            combined_features = torch.cat((embeddings, input_vals), dim=1)
+
+            # 4. Perform inference
+            logits = self.classifier(combined_features)
+
+        # 5. Process output
+        if self.task == "regression":
+            return logits.item()
+        else: # Classification
+            probabilities = torch.softmax(logits, dim=1)
+            pred_label = torch.argmax(probabilities, dim=1)[0].item() # Label 0 or 1
+            if true_label >= 0:
+                self.y_true.append(true_label)
+                self.y_pred.append(pred_label)
+                if len(self.y_true) % 100 == 0:
+                    metrics = calculate_metrics(self.y_true, self.y_pred)
+                    print(f"Precision={metrics['precision']:.4f}, \
+                      Recall={metrics['recall']:.4f}, F1={metrics['f1']}")
+            if return_prob:
+                return probabilities[0, 1].item() # Prob of class 1
+            else:
+                return logits
+
+    # -----------------------------
+    # Batched prediction interface
+    # -----------------------------
+    def predict_batch_processed(
+        self,
+        texts: List[str],
+        turns: List[int],
+        no_embedding: bool = False,
+        return_prob: bool = True,
+    ) -> List[float]:
+        """Predict probabilities or values for a batch of (text, turns).
+
+        This is a lightweight wrapper that reuses the same SentenceTransformer
+        call for all inputs, greatly reducing GPU contention compared to
+        calling ``predict_single_processed`` one-by-one.
+
+        Args:
+            texts: pre-processed text (same length as *turns*).
+            turns: number of turns in the conversation so far.
+            no_embedding: if ``True`` zero out sentence embeddings (ablation).
+            return_prob: if ``True`` return probability of class-1 for
+                classification; otherwise return raw logits.
+
+        Returns:
+            List[float]: probability (classification) or value (regression)
+                for each input.
+        """
+        assert len(texts) == len(turns), "texts and turns must have same length"
+
+        self.classifier.eval()
+
+        # 1. Numeric turns tensor
+        input_vals = torch.tensor(turns, dtype=torch.float).unsqueeze(1).to(self._device)
+
+        # 2. Encode batch of texts
+        with torch.no_grad():
+            embeddings = self.bert.encode(texts, convert_to_tensor=True, batch_size=len(texts))
+            if no_embedding:
+                embeddings.zero_()
+
+            # 3. Concatenate features and run classifier
+            combined = torch.cat((embeddings, input_vals), dim=1)
+            logits = self.classifier(combined)
+
+        if self.task == "regression":
+            return logits.squeeze(-1).cpu().tolist()
+        else:
+            if return_prob:
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                return probs.cpu().tolist()
+            else:
+                return logits.cpu().tolist()
 
 
 # ==== RUN MODEL ====

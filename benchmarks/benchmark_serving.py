@@ -368,7 +368,7 @@ async def benchmark(
                 output = await request_func(
                     request_func_input=request_func_input, pbar=pbar)
 
-        print(f"[trace],"
+        print(f"\n[trace],"
               f"{request_func_input.conversation_id},"
               f"{request_func_input.prompt_len},"
               f"{output.prompt_len},"

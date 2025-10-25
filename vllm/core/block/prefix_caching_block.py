@@ -2,6 +2,7 @@
 """Token blocks."""
 import copy
 import sys
+import random
 from bisect import bisect_left
 from os.path import commonprefix
 from typing import (Callable, Dict, FrozenSet, Iterable, List, Optional, Set,
@@ -57,22 +58,27 @@ class BlockTracker:
         cache_hint = copy.deepcopy(cache_hint)
         if self.cache_hint is None:
             self.cache_hint = cache_hint
-        else:
-            # the same conversation
-            if self.cache_hint['id'] == cache_hint['id']:
-                if self.cache_hint['turns'] < cache_hint['turns']:
-                    self.cache_hint = cache_hint
-            elif 'next_timestamp' in cache_hint:
-                if self.cache_hint['next_timestamp'] < cache_hint['next_timestamp']:
-                    self.cache_hint = cache_hint
-            else:
-                p = probability_of_future_arrival(
-                    self.cache_hint['prob_has_next'], self.cache_hint['exp_scale'], 
-                    last_accessed - self.last_accessed, debug=True)
-                if p > cache_hint['prob_has_next']:
-                    # print("overwrite: ", self.cache_hint, cache_hint)
-                    cache_hint['prob_has_next'] = p
+            self.last_accessed = last_accessed
+            return
+
+        # Heuristic to merge cache hints if a block is shared across different conversations
+        # The goal is to keep the hint that suggests a higher probability of being reused.
+        if self.cache_hint.get('id') == cache_hint.get('id'):
+            # Same conversation, newer turn is more informative
+            if self.cache_hint.get('turns', -1) < cache_hint.get('turns', -1):
                 self.cache_hint = cache_hint
+        else:
+            # Different conversations, compare future arrival probabilities
+            # and keep the hint with a higher probability.
+            p_old = probability_of_future_arrival(
+                self.cache_hint.get('prob_has_next', 0),
+                self.cache_hint.get('exp_scale', 1.0),
+                last_accessed - self.last_accessed
+            )
+            p_new = cache_hint.get('prob_has_next', 0)
+            if p_new > p_old:
+                self.cache_hint = cache_hint
+        
         self.last_accessed = last_accessed
 
 class PrefixCachingBlockAllocator(BlockAllocator):
@@ -370,15 +376,18 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             block_id, content_hash_to_evict = self.evictor.evict()
 
             # Sanity checks
-            # assert content_hash_to_evict in self._cached_blocks
             if content_hash_to_evict in self._cached_blocks:
                 _block_id = self._cached_blocks[content_hash_to_evict]
-                # assert self._refcounter.get(_block_id) == 0
-                # assert _block_id == block_id
-                if _block_id == block_id and self._refcounter.get(_block_id) == 0:
-                    self._cached_blocks.pop(content_hash_to_evict)
-                    break
-            # print(f"cannot evict: {block_id}")
+                if self._refcounter.get(_block_id) == 0:
+                    if _block_id == block_id:
+                        self._cached_blocks.pop(content_hash_to_evict)
+                        break
+                    else:
+                        # This can happen if two different blocks have the same content hash due to collision.
+                        # We should evict the one that the evictor chose.
+                        self.evictor.remove(_block_id) # Remove the other block from evictor
+                        self._cached_blocks.pop(content_hash_to_evict)
+                        break
 
         self._refcounter.incr(block_id)
         self._track_block_id(block_id, computed=False)
@@ -617,14 +626,12 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         """
 
         for block_id in block_ids:
-            if self._block_tracker[block_id].active:
-                self._block_tracker[block_id].overwrite_block_metadata(now, cache_hint)
-            elif block_id in self.evictor:
-                print(f'block {cache_hint} is updated in the evictor')
+            # It's possible the block is not active if it was just freed
+            # and is now in the evictor.
+            if block_id in self.evictor:
                 self.evictor.update(block_id, now, cache_hint)
-            else:
-                raise ValueError(
-                    "Mark block as accessed which is not belonged to GPU")
+            elif self._block_tracker[block_id].active:
+                self._block_tracker[block_id].overwrite_block_metadata(now, cache_hint)
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
         # Mark all touched blocks as computed.
@@ -1187,18 +1194,25 @@ class LastAccessBlocksTracker:
 
     def update_blocks_metadata_using_seq_metadata(self, seq_id: int, block_ids: List[int]) -> None:
         # Block until the predicted cache_hint for this seq_id is available
+        if seq_id not in self._seq_cache_hint:
+            # Sequence was likely freed before being accessed.
+            return
+            
         if 'prob_has_next' not in self._seq_cache_hint[seq_id]:
-            print('skip prediction for seq_id', seq_id)
-            self._seq_cache_hint[seq_id]['prob_has_next'] = 0
+            print('Prediction is not available for seq_id', seq_id)
+            self._seq_cache_hint[seq_id]['prob_has_next'] = 0.2
         # ---------------------------------------------
         # ablation study
         # self._seq_cache_hint[seq_id]['prob_has_next'] = 1
         # ---------------------------------------------
-        ts = self._seq_last_access[seq_id]
+        ts = self._seq_last_access.get(seq_id)
         if ts is None:
+            # Sequence was likely freed before being accessed.
             return
-        # print('Mark_blocks with cache hint: ', self._seq_cache_hint[seq_id])
-        self._allocator.mark_blocks_as_accessed(block_ids, ts, self._seq_cache_hint[seq_id])
+        
+        cache_hint = self.get_cache_hint(seq_id)
+        if cache_hint:
+            self._allocator.mark_blocks_as_accessed(block_ids, ts, cache_hint)
 
 
 def assert_prefix_caching_block_or_none(block: Optional[Block]):

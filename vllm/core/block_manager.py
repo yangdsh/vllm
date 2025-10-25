@@ -10,7 +10,7 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
-from vllm.core.online_learning_manager import OnlineLearningManager
+from vllm.core.evictor_ml_manager import OnlineLearningManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
@@ -284,6 +284,14 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # The sequence has already been freed.
             return
 
+        # Fewer blocking operations: don't wait indefinitely for predictions
+        # If prediction isn't ready quickly, proceed with a default value
+        if (seq.cache_hint and 'prob_has_next' not in seq.cache_hint):
+            # Give a very short window for prediction to complete
+            time.sleep(0.001)  # 1ms
+            if 'prob_has_next' not in seq.cache_hint:
+                seq.cache_hint['prob_has_next'] = 0.2  # Conservative default
+
         # --- Online Learning: Update conversation state on free ---
         if self.online_learning_manager:
             self.online_learning_manager.on_free(seq)
@@ -325,10 +333,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             # only during freeing of block ids, the blocks are actually added to
             # the evictor (which is when the most updated time is required)
             # (This avoids expensive calls to mark_blocks_as_accessed(..))
+            if seq.cache_hint:
+                self._last_access_blocks_tracker.update_cache_hint(
+                    seq.seq_id, seq.cache_hint)
             self._last_access_blocks_tracker.update_last_access(
                 seq.seq_id, now)
-            self._last_access_blocks_tracker.update_cache_hint(
-                seq.seq_id, seq.cache_hint)
 
     def mark_blocks_as_computed(self, seq_group: SequenceGroup,
                                 token_chunk_size: int):
