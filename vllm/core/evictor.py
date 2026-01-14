@@ -146,9 +146,6 @@ class LRUMLEvictor(Evictor):
         
         # Profiler
         self.profiler = EvictionProfiler()
-        
-        # ML accuracy tracker
-        self.accuracy_tracker = MLAccuracyTracker(threshold=0.5, report_interval=100)
 
     def __contains__(self, block_id: int) -> bool:
         return block_id in self.free_table
@@ -229,12 +226,6 @@ class LRUMLEvictor(Evictor):
                 self.id_to_last_access[cache_hint['id']] = last_accessed
             if block_id not in self.id_to_first_access:
                 self.id_to_first_access[block_id] = last_accessed
-            
-            # Track ML accuracy
-            if 'prob_has_next' in cache_hint and 'true_tta' in cache_hint:
-                prob = cache_hint['prob_has_next']
-                true_tta = cache_hint['true_tta']
-                self.accuracy_tracker.record(prob, true_tta)
                 
             # Background threading: trigger async refresh
             if time.time() - self.last_refresh_time > self.INSPECT_INTERVAL:

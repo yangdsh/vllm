@@ -367,6 +367,7 @@ class ShareGPTDataset(BenchmarkDataset):
                human_delay: float = 0,   # Fixed delay added for human turns
                max_active_conversations: int = 100,
                time_limit: int = 10000,
+               skip_first: float = 0.0,  # Skip first N% of dataset (0.0-1.0)
                **kwargs) -> list:
         samples: list = []
         # Stores the timestamp of the *last* request for potentially active conversations.
@@ -375,7 +376,15 @@ class ShareGPTDataset(BenchmarkDataset):
         self.conversation_id = 0 # Ensure conversation ID starts fresh
         last_conv_start_timestamp = 0.0 # Track the start time of the previous conv
 
-        for entry_index, entry in enumerate(self.data):
+        # Skip first portion of dataset (to avoid data leaking in data collection)
+        data_to_use = self.data
+        if skip_first > 0:
+            skip_count = int(len(self.data) * skip_first)
+            data_to_use = self.data[skip_count:]
+            print(f"[ShareGPTDataset] Skipping first {skip_count} entries "
+                  f"({skip_first*100:.0f}%), using {len(data_to_use)} entries")
+
+        for entry_index, entry in enumerate(data_to_use):
             if len(samples) >= num_requests:
                 print('got enough samples')
                 break

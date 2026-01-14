@@ -1197,8 +1197,13 @@ class LastAccessBlocksTracker:
         if seq_id not in self._seq_cache_hint:
             # Sequence was likely freed before being accessed.
             return
+        
+        # Check if cache_hint is None (can happen in offline inference without ML eviction)
+        cache_hint_val = self._seq_cache_hint[seq_id]
+        if cache_hint_val is None:
+            return
             
-        if 'prob_has_next' not in self._seq_cache_hint[seq_id]:
+        if 'prob_has_next' not in cache_hint_val:
             print('Prediction is not available for seq_id', seq_id)
             self._seq_cache_hint[seq_id]['prob_has_next'] = 0.2
         # ---------------------------------------------

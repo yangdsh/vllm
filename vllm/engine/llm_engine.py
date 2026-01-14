@@ -1029,6 +1029,33 @@ class LLMEngine:
         assert len(seq_group_metadata_list) == len(
             scheduler_outputs.scheduled_seq_groups)
 
+        # --- Extract hidden states for ML-based prefix cache eviction if available ---
+        # We use output.hidden_states (not prefill_hidden_states)
+        # because it already contains only the selected tokens (typically the
+        # last token per sequence).
+        # This means we can index by prompt order directly.
+        if (outputs and isinstance(outputs[0], SamplerOutput)
+                and outputs[0].hidden_states is not None):
+            hidden_states = outputs[0].hidden_states
+
+            # hidden_states has one entry per prompt in the same order as
+            # seq_group_metadata_list / scheduled_seq_groups.
+            seq_idx_offset = 0
+            for sgm, scheduled_sg in zip(seq_group_metadata_list,
+                                         scheduler_outputs.scheduled_seq_groups):
+                if not sgm.is_prompt:
+                    continue
+
+                scheduler = self.scheduler[0]  # virtual_engine is always 0 here
+                block_manager = getattr(scheduler, "block_manager", None)
+                if hasattr(block_manager, "extract_hidden_states_for_prefix_cache"):
+                    block_manager.extract_hidden_states_for_prefix_cache(
+                        seq_group=scheduled_sg.seq_group,
+                        hidden_states=hidden_states,
+                        seq_idx_offset=seq_idx_offset,
+                    )
+                seq_idx_offset += 1
+
         has_multiple_outputs: bool = len(outputs) > 1
         outputs_by_sequence_group: List[List[SequenceGroupOutput]]
         if has_multiple_outputs:

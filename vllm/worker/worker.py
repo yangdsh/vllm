@@ -64,15 +64,25 @@ class Worker(LocalOrDistributedWorkerBase):
             init_cached_hf_modules()
 
         # Return hidden states from target model if the draft model is an
-        # mlp_speculator
+        # mlp_speculator, or if VLLM_RETURN_HIDDEN_STATES env var is set
         speculative_config = self.speculative_config
         model_config = self.model_config
+        
+        # Check if hidden states should be returned
+        return_hidden_for_collection = os.environ.get(
+            "VLLM_RETURN_HIDDEN_STATES", "0") == "1"
+        
         speculative_args = {} if speculative_config is None \
             or (speculative_config.draft_model_config.hf_config.model_type ==
                 model_config.hf_config.model_type) \
             or (speculative_config.draft_model_config.hf_config.model_type
                 not in ("medusa", "mlp_speculator", "eagle", "deepseek_mtp")) \
                     else {"return_hidden_states": True}
+        
+        # Enable hidden states return if env var is set
+        if return_hidden_for_collection:
+            speculative_args["return_hidden_states"] = True
+            logger.info("Hidden states return enabled")
 
         ModelRunnerClass: Type[GPUModelRunnerBase] = ModelRunner
         if model_config.runner_type == "pooling":

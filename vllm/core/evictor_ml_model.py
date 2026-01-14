@@ -168,45 +168,85 @@ def prepare_dataloaders(
 
 # --- MLP Classifier Definition ---
 class MLPClassifier(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256, output_dim=2, num_layers=4, dropout=0.3):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=2, num_layers=4, dropout=0.3,
+                 use_layer_norm=False):
+        """
+        MLP classifier for follow-up prediction.
+        
+        Args:
+            input_dim: Input dimension
+            hidden_dim: Hidden layer dimension
+            output_dim: Output dimension (2 for binary classification)
+            num_layers: Number of layers
+            dropout: Dropout rate
+            use_layer_norm: If True, use LayerNorm instead of BatchNorm1d.
+                           Hidden state models use LayerNorm, text models use BatchNorm.
+        """
         super(MLPClassifier, self).__init__()
         layers = []
         current_dim = input_dim
+        
+        # Select normalization layer type
+        norm_layer = nn.LayerNorm if use_layer_norm else nn.BatchNorm1d
+        
         if num_layers == 1:
              layers.append(nn.Linear(current_dim, output_dim))
         else:
             layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(norm_layer(hidden_dim))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
             current_dim = hidden_dim
             for _ in range(num_layers - 2):
                 layers.append(nn.Linear(current_dim, hidden_dim))
-                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(norm_layer(hidden_dim))
                 layers.append(nn.ReLU())
                 layers.append(nn.Dropout(dropout))
                 current_dim = hidden_dim
             layers.append(nn.Linear(current_dim, output_dim))
         self.network = nn.Sequential(*layers)
+        
     def forward(self, x):
         return self.network(x)
 
 
 # --- Main ML Model Class (Refactored) ---
 class MLModel:
-    """ ML-based model using Sentence Transformers and MLP classifier. """
+    """ ML-based model using Sentence Transformers and MLP classifier. 
+    Can also use KV cache tensors as embeddings instead of text.
+    """
     def __init__(self, 
                  bert_model_name: str = "intfloat/multilingual-e5-small", 
-                 #"sentence-transformers/all-MiniLM-L6-v2", # 
                  hidden_dim: int = 128, num_layers: int = 3, 
-                 dropout: float = 0.3, task: str = "classification", train_mode = False,
-                 dataset_choice: Optional[str] = None, device: Optional[str] = None ):
-        # (Initialization remains the same - no data attributes)
+                 dropout: float = 0.3, task: str = "classification", train_mode: bool = False,
+                 dataset_choice: Optional[str] = None, device: Optional[str] = None,
+                 use_hidden_state_embeddings: bool = False, 
+                 hidden_state_dim: Optional[int] = None):
+        """
+        Initialize MLModel.
+        
+        Args:
+            bert_model_name: Name/path of the BERT model for text embeddings.
+            hidden_dim: Hidden dimension for MLP classifier.
+            num_layers: Number of layers in MLP.
+            dropout: Dropout rate.
+            task: 'classification' or 'regression'.
+            train_mode: If True, initialize models for training.
+            dataset_choice: Name of dataset (for logging).
+            device: Device to use ('cuda' or 'cpu').
+            use_hidden_state_embeddings: If True, use hidden states from LLM instead of BERT.
+            hidden_state_dim: Dimension of hidden states (required if use_hidden_state_embeddings=True).
+        """
         self.text_to_embedding = {}
         self.bert_model_name = bert_model_name
+        self.use_hidden_state_embeddings = use_hidden_state_embeddings
+        self.hidden_state_dim = hidden_state_dim
+        
         if self.bert_model_name == "intfloat/multilingual-e5-small":
-            offline_bert_path = ("/scratch/gpfs/dy5/.cache/huggingface/hub/models--intfloat--multilingual-e5-small"
-                       "/snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846")
+            hf_home = os.environ.get('HF_HOME', '/scratch/gpfs/WLLOYD/dy5/huggingface/')
+            offline_bert_path = os.path.join(
+                hf_home, "hub/models--intfloat--multilingual-e5-small",
+            "snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846")
             if os.path.exists(offline_bert_path):
                 self.bert_model_name = offline_bert_path
         self.hidden_dim = hidden_dim
@@ -219,16 +259,29 @@ class MLModel:
         else: 
             self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self._device}")
+        
         if train_mode:
-            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device), 
-                                            model_kwargs={'torch_dtype': torch.float16})
-            self.bert.eval()
-            sentence_embedding_dimension = self.bert.get_sentence_embedding_dimension()
-            self.input_dim = sentence_embedding_dimension + 1
+            if not self.use_hidden_state_embeddings:
+                self.bert = SentenceTransformer(
+                    self.bert_model_name, device=str(self._device), 
+                                                model_kwargs={'torch_dtype': torch.float16})
+                self.bert.eval()
+                sentence_embedding_dimension = self.bert.get_sentence_embedding_dimension()
+                self.input_dim = sentence_embedding_dimension + 1
+            else:
+                # Use hidden state embeddings instead of BERT
+                if hidden_state_dim is None:
+                    raise ValueError(
+                        "hidden_state_dim must be specified when "
+                        "use_hidden_state_embeddings=True")
+                self.input_dim = hidden_state_dim + 1
+                self.bert = None  # Not needed when using hidden state embeddings
+            
             self.output_dim = 1 if self.task == "regression" else 2
-            self.classifier = MLPClassifier(input_dim=self.input_dim, hidden_dim=self.hidden_dim, 
+            self.classifier = MLPClassifier(
+                input_dim=self.input_dim, hidden_dim=self.hidden_dim, 
                                             output_dim=self.output_dim, num_layers=self.num_layers, 
-                                            dropout=self.dropout ).to(self._device)
+                dropout=self.dropout).to(self._device)
         self.y_true = []
         self.y_pred = []
 
@@ -429,49 +482,104 @@ class MLModel:
     def load_model(self, model_path: str):
         if not os.path.exists(model_path): 
             raise FileNotFoundError(f"Model file not found at {model_path}")
-        checkpoint = torch.load(model_path, map_location=self._device)
+        checkpoint = torch.load(model_path, map_location=self._device, weights_only=False)
         if 'config' in checkpoint:
-            config = checkpoint['config']; print("Loading model configuration from checkpoint...")
-            self.bert_model_name = config.get('bert_model_name', self.bert_model_name)
-            if self.bert_model_name == "intfloat/multilingual-e5-small":
-                offline_bert_path = ("/scratch/gpfs/dy5/.cache/huggingface/hub/models--intfloat--multilingual-e5-small"
-                        "/snapshots/c007d7ef6fd86656326059b28395a7a03a7c5846")
-                if os.path.exists(offline_bert_path):
-                    self.bert_model_name = offline_bert_path
-            self.hidden_dim = config.get('hidden_dim', self.hidden_dim)
-            self.num_layers = config.get('num_layers', self.num_layers)
-            self.dropout = config.get('dropout', self.dropout)
-            self.task = config.get('task', self.task)
-            input_dim = config.get('input_dim', 384 + 1)
-            output_dim = config.get('output_dim', 2)
+            config = checkpoint['config']
+            print("Loading model configuration from checkpoint...")
+            
+            # Check if this is a hidden state model
+            # Hidden state models have hidden_state_dim in config (typically 4096)
+            hidden_state_dim = config.get('hidden_state_dim')
+            if hidden_state_dim is not None and hidden_state_dim > 0:
+                # This is a hidden state model - don't load BERT
+                print(f"Detected hidden state model (dim={hidden_state_dim})")
+                self.use_hidden_state_embeddings = True
+                self.hidden_state_dim = hidden_state_dim
+                self.bert = None
+                
+                # Load MLP config
+                self.hidden_dim = config.get('mlp_hidden_dim', config.get('hidden_dim', 256))
+                self.num_layers = config.get('num_layers', self.num_layers)
+                self.dropout = config.get('dropout', self.dropout)
+                self.input_dim = config.get('input_dim', hidden_state_dim + 1)
+                output_dim = config.get('output_dim', 2)
+                
+                print(f"Re-initializing Classifier with HParams: "
+                      f"input_dim={self.input_dim}, hidden={self.hidden_dim}, "
+                      f"layers={self.num_layers}, dropout={self.dropout}, "
+                      f"use_layer_norm=True")
+                self.classifier = MLPClassifier(
+                    input_dim=self.input_dim, hidden_dim=self.hidden_dim, 
+                    output_dim=output_dim, num_layers=self.num_layers, 
+                    dropout=self.dropout, use_layer_norm=True  # Hidden state models use LayerNorm
+                ).to(self._device)
+            else:
+                # This is a text embedding model - load BERT
+                self.use_hidden_state_embeddings = False
+                self.bert_model_name = config.get('bert_model_name', self.bert_model_name)
+                if self.bert_model_name == "intfloat/multilingual-e5-small":
+                    hf_home = os.environ.get('HF_HOME', '/scratch/gpfs/WLLOYD/dy5/huggingface/')
+                    offline_bert_path = os.path.join(
+                        hf_home, 
+                        "hub/models--intfloat--multilingual-e5-small/snapshots/"
+                        "c007d7ef6fd86656326059b28395a7a03a7c5846"
+                    )
+                    if os.path.exists(offline_bert_path):
+                        self.bert_model_name = offline_bert_path
+                self.hidden_dim = config.get('hidden_dim', self.hidden_dim)
+                self.num_layers = config.get('num_layers', self.num_layers)
+                self.dropout = config.get('dropout', self.dropout)
+                self.task = config.get('task', self.task)
+                self.input_dim = config.get('input_dim', 384 + 1)
+                output_dim = config.get('output_dim', 2)
 
-            print(f"Re-initializing BERT with: {self.bert_model_name}")
-            self.bert = SentenceTransformer(self.bert_model_name, device=str(self._device), 
-                                            model_kwargs={'torch_dtype': torch.float16})
-            self.bert.eval()
-            print(f"Re-initializing Classifier with HParams: \
-                  hidden={self.hidden_dim}, layers={self.num_layers}, dropout={self.dropout}")
-            self.classifier = MLPClassifier(input_dim=input_dim, hidden_dim=self.hidden_dim, output_dim=output_dim, 
-                                            num_layers=self.num_layers, dropout=self.dropout).to(self._device)
-        else: print("Warning: No config found in checkpoint.")
+                print(f"Re-initializing BERT with: {self.bert_model_name}")
+                self.bert = SentenceTransformer(
+                    self.bert_model_name, device=str(self._device), 
+                    model_kwargs={'torch_dtype': torch.float16}
+                )
+                self.bert.eval()
+                print(f"Re-initializing Classifier with HParams: "
+                      f"input_dim={self.input_dim}, hidden={self.hidden_dim}, "
+                      f"layers={self.num_layers}, dropout={self.dropout}")
+                self.classifier = MLPClassifier(
+                    input_dim=self.input_dim, hidden_dim=self.hidden_dim, 
+                    output_dim=output_dim, num_layers=self.num_layers, 
+                    dropout=self.dropout
+                ).to(self._device)
+        else:
+            print("Warning: No config found in checkpoint.")
+            
         if 'model_state_dict' in checkpoint:
             self.classifier.load_state_dict(checkpoint['model_state_dict'])
         else: 
-            self.classifier.load_state_dict(checkpoint) # Legacy
-        self.classifier.to(self._device); self.classifier.eval()
-        print(f"Classifier state_dict loaded from {model_path} and set to eval mode.")
+            self.classifier.load_state_dict(checkpoint)  # Legacy
+        self.classifier.to(self._device)
+        self.classifier.eval()
+        print(f"Classifier state_dict loaded from {model_path} and set to "
+              "eval mode.")
 
     def predict_single_processed(
         self,
-        preprocessed_text: str, # Takes preprocessed text now
-        turns: int,
-        true_label = -1,
+        preprocessed_text: Optional[str] = None,
+        turns: int = 0,
+        true_label: int = -1,
         no_embedding: bool = False,
-        return_prob: bool = True
+        return_prob: bool = True,
+        hidden_state: Optional[torch.Tensor] = None
     ) -> Union[float, int]:
         """
-        Predicts outcome for a single instance using PREPROCESSED text.
+        Predicts outcome for a single instance using PREPROCESSED text or hidden state.
         Performs direct inference.
+        
+        Args:
+            preprocessed_text: Preprocessed text (required if not using hidden state)
+            turns: Number of conversation turns
+            true_label: True label for evaluation (optional)
+            no_embedding: If True, zero out embeddings (ablation)
+            return_prob: If True, return probability; else return logits
+            hidden_state: Optional hidden state tensor from model's last layer.
+                         If provided, this will be used instead of text embeddings.
         """
         self.classifier.eval() # Ensure evaluation mode
         
@@ -480,12 +588,43 @@ class MLModel:
         # 1. Prepare input tensors
         input_vals = torch.tensor([[turns]] * 1, dtype=torch.float).to(self._device)
 
-        # 2. Encode text (already preprocessed)
+        # 2. Get embeddings from either hidden state or text
         with torch.no_grad():
-            # Note: Encoding even a single sentence has overhead.
-            embeddings = self.bert.encode([preprocessed_text] * 1, convert_to_tensor=True, batch_size=1)
-            if no_embedding:
-                embeddings.zero_()
+            if hidden_state is not None:
+                # Use hidden state as embedding
+                if isinstance(hidden_state, torch.Tensor):
+                    hidden_state = hidden_state.to(self._device)
+                
+                # Flatten and unsqueeze for batch dimension
+                embedding = hidden_state.flatten().unsqueeze(0)  # [1, hidden_dim]
+
+                # If the embedding dimension doesn't match, fall back to zero
+                # embedding to avoid using inconsistent features.
+                if embedding.shape[1] != self.input_dim - 1:
+                    if not hasattr(self, "_dim_mismatch_warned_single"):
+                        print(
+                            "[MLModel] WARNING: Hidden-state embedding dim "
+                            f"{embedding.shape[1]} != expected "
+                            f"{self.input_dim - 1}; using zero embedding "
+                            "in predict_single_processed()."
+                        )
+                        self._dim_mismatch_warned_single = True
+                    embedding = torch.zeros(
+                        1, self.input_dim - 1, device=self._device)
+                
+                embeddings = embedding
+                if no_embedding:
+                    embeddings.zero_()
+            else:
+                # Use text embeddings (original behavior)
+                if preprocessed_text is None:
+                    raise ValueError("Either preprocessed_text or hidden_state must be provided")
+                if self.bert is None:
+                    raise ValueError("BERT model not initialized. Cannot use text embeddings.")
+                # Note: Encoding even a single sentence has overhead.
+                embeddings = self.bert.encode([preprocessed_text] * 1, convert_to_tensor=True, batch_size=1)
+                if no_embedding:
+                    embeddings.zero_()
 
             # 3. Combine features
             combined_features = torch.cat((embeddings, input_vals), dim=1)
@@ -498,16 +637,14 @@ class MLModel:
             return logits.item()
         else: # Classification
             probabilities = torch.softmax(logits, dim=1)
-            pred_label = torch.argmax(probabilities, dim=1)[0].item() # Label 0 or 1
+            prob_class_1 = probabilities[0, 1].item()
+            pred_label = torch.argmax(probabilities, dim=1)[0].item()  # Label 0 or 1
+            
             if true_label >= 0:
                 self.y_true.append(true_label)
                 self.y_pred.append(pred_label)
-                if len(self.y_true) % 100 == 0:
-                    metrics = calculate_metrics(self.y_true, self.y_pred)
-                    print(f"Precision={metrics['precision']:.4f}, \
-                      Recall={metrics['recall']:.4f}, F1={metrics['f1']}")
             if return_prob:
-                return probabilities[0, 1].item() # Prob of class 1
+                return prob_class_1  # Prob of class 1
             else:
                 return logits
 
@@ -516,40 +653,85 @@ class MLModel:
     # -----------------------------
     def predict_batch_processed(
         self,
-        texts: List[str],
-        turns: List[int],
+        texts: Optional[List[str]] = None,
+        turns: Optional[List[int]] = None,
         no_embedding: bool = False,
         return_prob: bool = True,
+        hidden_states_list: Optional[List[torch.Tensor]] = None,
     ) -> List[float]:
-        """Predict probabilities or values for a batch of (text, turns).
+        """Predict probabilities or values for a batch of (text, turns) or hidden states.
 
         This is a lightweight wrapper that reuses the same SentenceTransformer
         call for all inputs, greatly reducing GPU contention compared to
         calling ``predict_single_processed`` one-by-one.
 
         Args:
-            texts: pre-processed text (same length as *turns*).
+            texts: pre-processed text (same length as *turns*). Required if not 
+                   using hidden states.
             turns: number of turns in the conversation so far.
             no_embedding: if ``True`` zero out sentence embeddings (ablation).
             return_prob: if ``True`` return probability of class-1 for
                 classification; otherwise return raw logits.
+            hidden_states_list: Optional list of hidden state tensors.
+                           If provided, these will be used instead of text embeddings.
 
         Returns:
             List[float]: probability (classification) or value (regression)
                 for each input.
         """
-        assert len(texts) == len(turns), "texts and turns must have same length"
+        if hidden_states_list is not None:
+            batch_size = len(hidden_states_list)
+            if turns is None:
+                turns = [0] * batch_size
+            assert len(turns) == batch_size, \
+                "turns must have same length as hidden_states_list"
+        else:
+            if texts is None or turns is None:
+                raise ValueError(
+                    "Either (texts, turns) or hidden_states_list must be provided")
+            assert len(texts) == len(turns), "texts and turns must have same length"
+            batch_size = len(texts)
 
         self.classifier.eval()
 
         # 1. Numeric turns tensor
         input_vals = torch.tensor(turns, dtype=torch.float).unsqueeze(1).to(self._device)
 
-        # 2. Encode batch of texts
+        # 2. Get embeddings from either KV tensors or text
         with torch.no_grad():
-            embeddings = self.bert.encode(texts, convert_to_tensor=True, batch_size=len(texts))
-            if no_embedding:
-                embeddings.zero_()
+            if hidden_states_list is not None:
+                # Use hidden states as embeddings
+                embeddings_list = []
+                for hidden_state in hidden_states_list:
+                    if isinstance(hidden_state, torch.Tensor):
+                        hidden_state = hidden_state.to(self._device)
+
+                    embedding = hidden_state.flatten()
+
+                    # If the embedding dimension doesn't match, fall back to
+                    # zero embedding for this sample.
+                    if embedding.shape[0] != self.input_dim - 1:
+                        print(
+                            "[MLModel] WARNING: Hidden-state embedding dim "
+                            f"{embedding.shape[0]} != expected "
+                            f"{self.input_dim - 1}; using zero embedding "
+                            "in predict_batch_processed()."
+                        )
+                        embedding = torch.zeros(
+                            self.input_dim - 1, device=self._device)
+
+                    embeddings_list.append(embedding)
+                
+                embeddings = torch.stack(embeddings_list)  # [batch_size, embedding_dim]
+                if no_embedding:
+                    embeddings.zero_()
+            else:
+                # Use text embeddings (original behavior)
+                if self.bert is None:
+                    raise ValueError("BERT model not initialized. Cannot use text embeddings.")
+                embeddings = self.bert.encode(texts, convert_to_tensor=True, batch_size=len(texts))
+                if no_embedding:
+                    embeddings.zero_()
 
             # 3. Concatenate features and run classifier
             combined = torch.cat((embeddings, input_vals), dim=1)

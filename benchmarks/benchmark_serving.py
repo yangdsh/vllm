@@ -681,7 +681,8 @@ def main(args: argparse.Namespace):
                                         conv_scale=1/args.session_rate,
                                         req_scale=1/args.request_rate,
                                         max_active_conversations=args.max_active_conversations,
-                                        time_limit=args.time_limit
+                                        time_limit=args.time_limit,
+                                        skip_first=args.skip_first,
                                     ),
             "burstgpt":
             lambda: BurstGPTDataset(random_seed=args.seed,
@@ -889,6 +890,13 @@ if __name__ == "__main__":
         "--time-limit",
         type=int,
         default=10000,
+    )
+    parser.add_argument(
+        "--skip-first",
+        type=float,
+        default=0.0,
+        help="Skip first N%% of dataset (0.0-1.0). Use 0.5 to skip first half "
+             "and avoid data leaking when collecting training data.",
     )
     parser.add_argument(
         "--request-rate",

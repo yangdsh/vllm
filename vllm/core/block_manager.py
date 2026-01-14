@@ -24,9 +24,6 @@ import json
 SeqId = int
 EncoderSeqId = str
 
-# Debug flag for print statements
-ENABLE_DEBUG_PRINTS = False
-
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
     """BlockSpaceManager which manages the allocation of KV cache.
 
@@ -130,7 +127,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 eviction_algorithm_config=eviction_algorithm_config)
         else:
             self.online_learning_manager = None
-
+    
     def can_allocate(self,
                      seq_group: SequenceGroup,
                      num_lookahead_slots: int = 0) -> AllocStatus:
@@ -346,6 +343,35 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # the scheduler is synchronous so blocks are actually computed when
         # scheduling the next batch.
         self.block_allocator.mark_blocks_as_computed([])
+
+    def extract_hidden_states_for_prefix_cache(
+        self,
+        seq_group: SequenceGroup,
+        hidden_states: 'torch.Tensor',
+        seq_idx_offset: int = 0,
+    ) -> None:
+        """Extract hidden states for sequences in a seq_group.
+
+        This should be called after model execution when ``hidden_states`` is
+        available from the sampler output. ``hidden_states`` is expected to
+        already contain one vector per prompt (typically the last token's
+        hidden state), in the same order as the scheduled prompt seq_groups.
+        """
+        if not self.online_learning_manager:
+            return
+
+        from vllm.sequence import SequenceStatus
+
+        for i, seq in enumerate(
+                seq_group.get_seqs(status=SequenceStatus.RUNNING)):
+            seq_idx = seq_idx_offset + i
+            if seq_idx < hidden_states.shape[0]:
+                hidden_state = hidden_states[seq_idx].clone()
+                # Store as CPU tensor to avoid GPU memory growth
+                seq.cache_hint["hidden_state"] = hidden_state.cpu().clone()
+
+                # Schedule prediction now that hidden state is available.
+                self.online_learning_manager.schedule_prediction(seq.cache_hint)
 
     def get_common_computed_block_ids(
             self, seqs: List[Sequence]) -> GenericSequence[int]:
