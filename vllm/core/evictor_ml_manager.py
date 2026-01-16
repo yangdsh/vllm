@@ -172,6 +172,10 @@ class OnlineLearningManager:
             "enable_online_learning", False)
         self.model_path = self.eviction_algorithm_config.get("model_path", "")
         
+        # Check if we should use hidden state embeddings
+        self.use_hidden_state = self.eviction_algorithm_config.get(
+            "use_hidden_state", False)
+        
         # Data collection for offline training
         self.enable_data_collection = self.eviction_algorithm_config.get(
             "enable_data_collection", False)
@@ -187,18 +191,31 @@ class OnlineLearningManager:
             self.data_collector = None
 
         if os.path.exists(self.model_path):
-            if ENABLE_DEBUG_PRINTS:
-                print(
-                    "Loading existing model for online learning from "
-                    f"{self.model_path}")
-            self.ml_model = MLModel(task="classification", train_mode=False)
+            print(
+                "Loading existing model for online learning from "
+                f"{self.model_path}")
+            if self.use_hidden_state:
+                self.ml_model = MLModel(
+                    task="classification", 
+                    train_mode=False,
+                    use_hidden_state_embeddings=True
+                )
+            else:
+                self.ml_model = MLModel(task="classification", train_mode=False)
             self.ml_model.load_model(self.model_path)
         else:
-            if ENABLE_DEBUG_PRINTS:
-                print(
-                    "Warning: Model path not found. Initializing new model for "
-                    "online learning.")
-            self.ml_model = MLModel(task="classification", train_mode=True)
+            print(
+                "Warning: Model path not found. Initializing new model for "
+                "online learning.")
+            if self.use_hidden_state:
+                self.ml_model = MLModel(
+                    task="classification", 
+                    train_mode=True,
+                    use_hidden_state_embeddings=True,
+                    hidden_state_dim=4096
+                )
+            else:
+                self.ml_model = MLModel(task="classification", train_mode=True)
         
         self._ml_model_lock = threading.Lock()
         
