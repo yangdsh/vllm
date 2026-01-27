@@ -212,7 +212,7 @@ class OnlineLearningManager:
                     task="classification", 
                     train_mode=True,
                     use_hidden_state_embeddings=True,
-                    hidden_state_dim=4096
+                    embedding_dim=4096 # todo: should be set by the LLM model
                 )
             else:
                 self.ml_model = MLModel(task="classification", train_mode=True)
@@ -221,8 +221,8 @@ class OnlineLearningManager:
         
         # Batch processing for predictions
         self.to_predict_queue = queue.Queue()
-        self.batch_size = 64  # Process up to 64 predictions together
-        self.batch_timeout = 1  # 1s timeout for batch collection
+        self.batch_size = 16  # Process up to 16 predictions together
+        self.batch_timeout = 0.001  # 0.001s timeout for batch collection
         
         # Cache for predictions to avoid repeated computation
         # Key: (conv_id, turns), Value: prob_has_next
@@ -414,7 +414,7 @@ class OnlineLearningManager:
                 
                 self.to_predict_queue.task_done()
             
-            if self.profiler.batch_count % 20 == 19:
+            if self.profiler.batch_count % 100 == 99:
                 self.profiler.print_stats()
 
     def _online_learning_setup(self):

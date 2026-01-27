@@ -221,7 +221,7 @@ class MLModel:
                  dropout: float = 0.3, task: str = "classification", train_mode: bool = False,
                  dataset_choice: Optional[str] = None, device: Optional[str] = None,
                  use_hidden_state_embeddings: bool = False, 
-                 hidden_state_dim: Optional[int] = None):
+                 embedding_dim: Optional[int] = None):
         """
         Initialize MLModel.
         
@@ -235,12 +235,12 @@ class MLModel:
             dataset_choice: Name of dataset (for logging).
             device: Device to use ('cuda' or 'cpu').
             use_hidden_state_embeddings: If True, use hidden states from LLM instead of BERT.
-            hidden_state_dim: Dimension of hidden states (required if use_hidden_state_embeddings=True).
+            embedding_dim: Dimension of hidden states (required if use_hidden_state_embeddings=True).
         """
         self.text_to_embedding = {}
         self.bert_model_name = bert_model_name
         self.use_hidden_state_embeddings = use_hidden_state_embeddings
-        self.hidden_state_dim = hidden_state_dim
+        self.embedding_dim = embedding_dim
         
         if self.bert_model_name == "intfloat/multilingual-e5-small":
             hf_home = os.environ.get('HF_HOME', '/scratch/gpfs/WLLOYD/dy5/huggingface/')
@@ -270,11 +270,11 @@ class MLModel:
                 self.input_dim = sentence_embedding_dimension + 1
             else:
                 # Use hidden state embeddings instead of BERT
-                if hidden_state_dim is None:
+                if embedding_dim is None:
                     raise ValueError(
-                        "hidden_state_dim must be specified when "
+                        "embedding_dim must be specified when "
                         "use_hidden_state_embeddings=True")
-                self.input_dim = hidden_state_dim + 1
+                self.input_dim = embedding_dim + 1
                 self.bert = None  # Not needed when using hidden state embeddings
             
             self.output_dim = 1 if self.task == "regression" else 2
@@ -487,21 +487,17 @@ class MLModel:
             config = checkpoint['config']
             print("Loading model configuration from checkpoint...")
             
-            # Check if this is a hidden state model
-            # Hidden state models have hidden_state_dim in config (typically 4096)
-            hidden_state_dim = config.get('hidden_state_dim')
-            if hidden_state_dim is not None and hidden_state_dim > 0:
+            if self.use_hidden_state_embeddings:
                 # This is a hidden state model - don't load BERT
-                print(f"Detected hidden state model (dim={hidden_state_dim})")
-                self.use_hidden_state_embeddings = True
-                self.hidden_state_dim = hidden_state_dim
-                self.bert = None
+                embedding_dim = config.get(
+                    'embedding_dim', config.get('hidden_state_dim', 4096)
+                )
                 
-                # Load MLP config
-                self.hidden_dim = config.get('mlp_hidden_dim', config.get('hidden_dim', 256))
+                # Load MLP config - match reference implementation exactly
+                self.hidden_dim = config.get('mlp_hidden_dim', self.hidden_dim)
                 self.num_layers = config.get('num_layers', self.num_layers)
                 self.dropout = config.get('dropout', self.dropout)
-                self.input_dim = config.get('input_dim', hidden_state_dim + 1)
+                self.input_dim = config.get('input_dim', embedding_dim + 1)
                 output_dim = config.get('output_dim', 2)
                 
                 print(f"Re-initializing Classifier with HParams: "
@@ -515,7 +511,6 @@ class MLModel:
                 ).to(self._device)
             else:
                 # This is a text embedding model - load BERT
-                self.use_hidden_state_embeddings = False
                 self.bert_model_name = config.get('bert_model_name', self.bert_model_name)
                 if self.bert_model_name == "intfloat/multilingual-e5-small":
                     hf_home = os.environ.get('HF_HOME', '/scratch/gpfs/WLLOYD/dy5/huggingface/')
@@ -526,7 +521,8 @@ class MLModel:
                     )
                     if os.path.exists(offline_bert_path):
                         self.bert_model_name = offline_bert_path
-                self.hidden_dim = config.get('hidden_dim', self.hidden_dim)
+                # Load config - match reference implementation pattern
+                self.hidden_dim = config.get('mlp_hidden_dim', config.get('hidden_dim', self.hidden_dim))
                 self.num_layers = config.get('num_layers', self.num_layers)
                 self.dropout = config.get('dropout', self.dropout)
                 self.task = config.get('task', self.task)
@@ -550,10 +546,7 @@ class MLModel:
         else:
             print("Warning: No config found in checkpoint.")
             
-        if 'model_state_dict' in checkpoint:
-            self.classifier.load_state_dict(checkpoint['model_state_dict'])
-        else: 
-            self.classifier.load_state_dict(checkpoint)  # Legacy
+        self.classifier.load_state_dict(checkpoint['model_state_dict'])
         self.classifier.to(self._device)
         self.classifier.eval()
         print(f"Classifier state_dict loaded from {model_path} and set to "

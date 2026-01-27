@@ -35,8 +35,8 @@ This document describes the feature that enables using hidden states from the tr
                         │ states_for_prefix_  │
                         │ cache()             │
                         └─────────────────────┘
-                                │
-                                ▼
+                                    │
+                                    ▼
                         ┌─────────────────────┐
                         │  cache_hint dict    │
                         │ (hidden_state added)│
@@ -199,10 +199,4 @@ Where `label=1` means the conversation had a follow-up turn, `label=0` means it 
 
 1. **Dimension**: Hidden states are typically larger than text embeddings
 2. **Availability**: Only available after prefill (predictions during wait use text)
-3. **Memory**: Stored as CPU tensor in cache_hint to avoid GPU memory growth
 
-## Future Work
-
-- Add projection layer to map hidden states to smaller dimension
-- Support for extracting from multiple layers
-- Async extraction to reduce latency impact

@@ -213,6 +213,16 @@ class OnlineStatsTracker:
 
         if self.true_labels:
             true_labels = np.asarray(self.true_labels, dtype=int)
+            
+            # Ensure correct and true_labels have the same length
+            # (they should always match, but handle race conditions gracefully)
+            min_len = min(len(correct), len(true_labels))
+            if len(correct) != len(true_labels):
+                print(f"  Warning: Length mismatch - correct: {len(correct)}, "
+                      f"true_labels: {len(true_labels)}, using min: {min_len}")
+                correct = correct[:min_len]
+                true_labels = true_labels[:min_len]
+            
             label_0_mask = true_labels == 0
             label_1_mask = true_labels == 1
 

@@ -284,10 +284,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Fewer blocking operations: don't wait indefinitely for predictions
         # If prediction isn't ready quickly, proceed with a default value
         if (seq.cache_hint and 'prob_has_next' not in seq.cache_hint):
-            # Give a very short window for prediction to complete
-            time.sleep(0.001)  # 1ms
+            print("Warning: No prediction ready, using default value:",  
+                " prompt_len:", seq.get_prompt_len(), "output_len:", seq.get_output_len())
             if 'prob_has_next' not in seq.cache_hint:
-                seq.cache_hint['prob_has_next'] = 0.2  # Conservative default
+                seq.cache_hint['prob_has_next'] = 0.1
+                if int(seq.cache_hint['turns']) >= 1:
+                    seq.cache_hint['prob_has_next'] = 0.5
+
 
         # --- Online Learning: Update conversation state on free ---
         if self.online_learning_manager:

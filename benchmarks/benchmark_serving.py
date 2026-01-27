@@ -360,6 +360,14 @@ async def benchmark(
                  if max_concurrency else None)
 
     async def limited_request_func(request_func_input, pbar):
+        print(f"\n[start],"
+              f"{request_func_input.conversation_id},"
+              f"{request_func_input.prompt_len},"
+              f"{request_func_input.output_len},"
+              f"{request_func_input.turn_id},"
+              f"{request_func_input.timestamp},"
+              f"{request_func_input.next_timestamp}",
+              file=sys.stderr)
         if semaphore is None:
             output = await request_func(request_func_input=request_func_input,
                                       pbar=pbar)
