@@ -7,7 +7,7 @@ import time
 import statistics
 import numpy as np
 import threading
-from collections import defaultdict
+from collections import defaultdict, deque
 from sortedcontainers import SortedDict
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple
@@ -17,6 +17,7 @@ from vllm.core.evictor_profiler import EvictionProfiler, MLAccuracyTracker
 def probability_of_future_arrival(prob_has_next, exp_scale, elapsed_time, debug=False):
     if prob_has_next == 0 or exp_scale == 0:
         return 0.0
+    # print(f"prob_has_next: {prob_has_next}, exp_scale: {exp_scale}, elapsed_time: {elapsed_time}")
     prob_not_accessed_till_now = np.exp(-elapsed_time / exp_scale)
     return (prob_has_next * prob_not_accessed_till_now) / (
             prob_has_next * prob_not_accessed_till_now + (1 - prob_has_next)
@@ -27,6 +28,7 @@ class EvictionPolicy(enum.Enum):
        Evictor subclass.
     """
     LRU = enum.auto()
+    S3FIFO = enum.auto()
 
 
 class Evictor(ABC):
@@ -144,6 +146,9 @@ class LRUMLEvictor(Evictor):
         self._rescore_lock = threading.Lock()
         self._rescore_thread = None
         
+        # Track largest seen last_accessed for simulation time
+        self._max_last_accessed = 0.0
+        
         # Profiler
         self.profiler = EvictionProfiler()
 
@@ -166,10 +171,12 @@ class LRUMLEvictor(Evictor):
             
             prob_has_next = cache_hint.get('prob_has_next')
             if prob_has_next is not None:
+                # Use largest seen last_accessed instead of time.time()
+                current_time = max(self._max_last_accessed, last_accessed)
                 return probability_of_future_arrival(
                     prob_has_next,
                     cache_hint.get('exp_scale', 1.0),
-                    time.time() - last_accessed
+                    current_time - last_accessed
                 )
             
             # Default to LRU if no other hint is available
@@ -215,6 +222,9 @@ class LRUMLEvictor(Evictor):
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
         with self._rescore_lock, self.profiler.time_operation("add"):
+            # Update maximum seen last_accessed
+            self._max_last_accessed = max(self._max_last_accessed, last_accessed)
+            
             score = self._calc_score(block_id, last_accessed, cache_hint)
             self.free_table[block_id] = BlockMetaData(content_hash,
                                                       num_hashed_tokens,
@@ -235,6 +245,9 @@ class LRUMLEvictor(Evictor):
         with self._rescore_lock, self.profiler.time_operation("update"):
             if block_id not in self.free_table:
                 return
+
+            # Update maximum seen last_accessed
+            self._max_last_accessed = max(self._max_last_accessed, last_accessed)
 
             old_meta = self.free_table[block_id]
             old_entry = (old_meta.score, old_meta.last_accessed, block_id)
@@ -334,9 +347,11 @@ class LRUEvictor(Evictor):
     # a cleanup operation is triggered to reduce memory usage.
     CLEANUP_THRESHOLD = 50
 
-    def __init__(self):
+    def __init__(self, fifo_mode: bool = False):
+        self.fifo_mode = fifo_mode
         self.free_table: Dict[int, BlockMetaData] = {}
         self.priority_queue = []
+        self.detached_last_accessed: Dict[int, float] = {}
         self.stat = CacheStat()
 
     def __contains__(self, block_id: int) -> bool:
@@ -365,6 +380,8 @@ class LRUEvictor(Evictor):
 
     def add(self, block_id: int, content_hash: int, num_hashed_tokens: int,
             last_accessed: float, cache_hint: dict):
+        if self.fifo_mode and block_id in self.detached_last_accessed:
+            last_accessed = self.detached_last_accessed.pop(block_id)
         self.free_table[block_id] = BlockMetaData(content_hash,
                                                   num_hashed_tokens,
                                                   last_accessed,
@@ -375,7 +392,7 @@ class LRUEvictor(Evictor):
         self._cleanup_if_necessary()
 
     def update(self, block_id: int, last_accessed: float, cache_hint: dict):
-        if 'use_fifo' not in cache_hint or cache_hint['use_fifo'] == 0:
+        if not self.fifo_mode:
             self.free_table[block_id].last_accessed = last_accessed
         self.free_table[block_id].cache_hint = cache_hint
 
@@ -399,7 +416,220 @@ class LRUEvictor(Evictor):
         if block_id not in self.free_table:
             raise ValueError(
                 "Attempting to remove block that's not in the evictor")
+        if self.fifo_mode:
+            self.detached_last_accessed[block_id] = \
+                self.free_table[block_id].last_accessed
         self.free_table.pop(block_id)
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.free_table)
+
+
+class S3FIFOEvictor(Evictor):
+    """S3FIFO eviction with small/main/ghost FIFO queues.
+
+    This is a size-partitioned FIFO with a ghost list for main-queue evictions.
+    """
+
+    def __init__(self, config: str):
+        self.free_table: Dict[int, BlockMetaData] = {}
+        self.queue_by_id: Dict[int, str] = {}
+        self.freq_by_id: Dict[int, int] = {}
+        self.detached_by_id: Dict[int, Tuple[str, int]] = {}
+        self.small_queue = deque()
+        self.main_queue = deque()
+        self.ghost_queue = deque()
+        self.ghost_set = set()
+        self.small_size = 0
+        self.main_size = 0
+        self.stat = CacheStat()
+        self.config = self._parse_str_to_dict(config)
+        self.small_ratio = self.config.get("small_ratio", 0.1)
+        self.ghost_ratio = self.config.get("ghost_ratio", 1)
+        self.max_freq = max(1, int(self.config.get("max_freq", 1)))
+        print(f"S3FIFOEvictor config: {self.config}")
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self.free_table
+
+    def _parse_str_to_dict(self, s: str) -> dict:
+        if len(s) == 0:
+            return {}
+        return json.loads(s)
+
+    def _target_sizes(self) -> Tuple[int, int, int]:
+        total = len(self.free_table)
+        if total == 0:
+            return 0, 0, 0
+        small_target = max(1, int(total * self.small_ratio))
+        main_target = max(0, total - small_target)
+        ghost_target = max(1, int(total * self.ghost_ratio))
+        return small_target, main_target, ghost_target
+
+    def _pop_valid(self, queue: deque, queue_name: str) -> int:
+        while queue:
+            block_id = queue.popleft()
+            if block_id not in self.free_table:
+                continue
+            if self.queue_by_id.get(block_id) != queue_name:
+                continue
+            return block_id
+        return -1
+
+    def _pop_valid_ghost(self) -> int:
+        while self.ghost_queue:
+            content_hash = self.ghost_queue.popleft()
+            if content_hash in self.ghost_set:
+                return content_hash
+        return -1
+
+    def _trim_ghost(self) -> None:
+        _, _, ghost_target = self._target_sizes()
+        while len(self.ghost_set) > ghost_target:
+            content_hash = self._pop_valid_ghost()
+            if content_hash == -1:
+                break
+            self.ghost_set.discard(content_hash)
+
+    def _add_to_small(self, block_id: int) -> None:
+        self.small_queue.append(block_id)
+        self.queue_by_id[block_id] = "small"
+        self.small_size += 1
+
+    def _add_to_main(self, block_id: int) -> None:
+        self.main_queue.append(block_id)
+        self.queue_by_id[block_id] = "main"
+        self.main_size += 1
+
+    def _add_to_ghost(self, content_hash: int) -> None:
+        if content_hash in self.ghost_set:
+            return
+        self.ghost_set.add(content_hash)
+        self.ghost_queue.append(content_hash)
+        self._trim_ghost()
+
+    def _remove_from_ghost(self, content_hash: int) -> None:
+        if content_hash in self.ghost_set:
+            self.ghost_set.discard(content_hash)
+
+    def _evict_block(self,
+                     block_id: int,
+                     add_to_ghost: bool) -> Tuple[int, int]:
+        block_meta = self.free_table.pop(block_id)
+        queue_name = self.queue_by_id.pop(block_id, None)
+        self.freq_by_id.pop(block_id, None)
+        if queue_name == "small":
+            self.small_size -= 1
+        elif queue_name == "main":
+            self.main_size -= 1
+        if add_to_ghost:
+            self._add_to_ghost(block_meta.content_hash)
+        survival_time = time.time() - block_meta.last_accessed
+        self.stat.append("survival_times", survival_time)
+        return block_id, block_meta.content_hash
+
+    def _evict_from_small(self) -> Tuple[int, int]:
+        while True:
+            block_id = self._pop_valid(self.small_queue, "small")
+            if block_id == -1:
+                return -1, -1
+            
+            freq = self.freq_by_id.get(block_id, 0)
+            if freq > 0:
+                self.small_size -= 1
+                self.freq_by_id[block_id] = 0 
+                self._add_to_main(block_id)
+                continue 
+            else:
+                return self._evict_block(block_id, add_to_ghost=True)
+
+    def evict(self) -> Tuple[int, int]:
+        if len(self.free_table) == 0:
+            raise ValueError("No usable cache memory left")
+
+        while True:
+            small_target, _, _ = self._target_sizes()
+            
+            if self.small_size > small_target:
+                block_id, content_hash = self._evict_from_small()
+                if block_id != -1:
+                    return block_id, content_hash
+            
+            block_id, content_hash = self._evict_from_main()
+            if block_id != -1:
+                return block_id, content_hash
+            
+            block_id, content_hash = self._evict_from_small()
+            if block_id != -1:
+                return block_id, content_hash
+            
+            raise ValueError("Eviction failed: State seems inconsistent.")
+
+    def _evict_from_main(self) -> Tuple[int, int]:
+        while True:
+            block_id = self._pop_valid(self.main_queue, "main")
+            if block_id == -1:
+                return -1, -1
+            freq = self.freq_by_id.get(block_id, 0)
+            if freq > 0:
+                self.freq_by_id[block_id] = freq - 1
+                self.main_queue.append(block_id)
+                continue
+            return self._evict_block(block_id, add_to_ghost=True)
+
+    def add(self,
+            block_id: int,
+            content_hash: int,
+            num_hashed_tokens: int,
+            last_accessed: float,
+            cache_hint: dict):
+        self.free_table[block_id] = BlockMetaData(
+            content_hash=content_hash,
+            num_hashed_tokens=num_hashed_tokens,
+            last_accessed=last_accessed,
+            cache_hint=cache_hint,
+        )
+        if block_id in self.detached_by_id:
+            queue_name, freq = self.detached_by_id.pop(block_id)
+            self._remove_from_ghost(content_hash)
+            if queue_name == "main":
+                self._add_to_main(block_id)
+            else:
+                self._add_to_small(block_id)
+            self.freq_by_id[block_id] = min(self.max_freq, max(0, freq))
+            return
+
+        if content_hash in self.ghost_set:
+            self._remove_from_ghost(content_hash)
+            self._add_to_main(block_id)
+            self.freq_by_id[block_id] = 1
+        else:
+            self._add_to_small(block_id)
+            self.freq_by_id[block_id] = 0
+
+    def update(self, block_id: int, last_accessed: float, cache_hint: dict):
+        if block_id not in self.free_table:
+            return
+        block_meta = self.free_table[block_id]
+        block_meta.last_accessed = last_accessed
+        block_meta.cache_hint = cache_hint
+        freq = self.freq_by_id.get(block_id, 0)
+        self.freq_by_id[block_id] = min(self.max_freq, freq + 1)
+
+    def remove(self, block_id: int):
+        if block_id not in self.free_table:
+            return
+        queue_name = self.queue_by_id.pop(block_id, None)
+        freq = self.freq_by_id.pop(block_id, 0)
+        self.free_table.pop(block_id)
+        # Preserve original queue and bump freq
+        self.detached_by_id[block_id] = (queue_name or "small",
+                                         min(self.max_freq, freq + 1))
+        if queue_name == "small":
+            self.small_size -= 1
+        elif queue_name == "main":
+            self.main_size -= 1
 
     @property
     def num_blocks(self) -> int:
@@ -407,6 +637,9 @@ class LRUEvictor(Evictor):
 
 def make_evictor(eviction_algorithm: str, config: str) -> Evictor:
     if eviction_algorithm == 'lru':
-        return LRUEvictor()
-    else:
-        return LRUMLEvictor(config)
+        return LRUEvictor(fifo_mode=False)
+    if eviction_algorithm == 'fifo':
+        return LRUEvictor(fifo_mode=True)
+    if 's3fifo' in eviction_algorithm:
+        return S3FIFOEvictor(config)
+    return LRUMLEvictor(config)

@@ -616,7 +616,6 @@ class PrefixCachingBlockAllocator(BlockAllocator):
         """
         return self._cow_tracker.clear_cows()
 
-    # learn_conversation.py related: interact with the evictor
     def mark_blocks_as_accessed(self, block_ids: List[int],
                                 now: float, cache_hint: dict) -> None:
         """Mark blocks as accessed, used in prefix caching.

@@ -158,6 +158,19 @@ Key log messages (at INFO/DEBUG level):
 No additional configuration is required. The feature is enabled automatically when 
 using ML-based eviction algorithms.
 
+### Eviction Algorithm Options
+
+Prefix cache eviction supports `lru` and `s3fifo`. For S3FIFO, optional config
+keys are available in `eviction_algorithm_config`:
+
+```json
+{
+    "small_ratio": 0.1,
+    "ghost_ratio": 0.1,
+    "max_freq": 3
+}
+```
+
 ### Data Collection for Offline Training
 
 To collect training data (hidden states + labels) for offline MLP training:
